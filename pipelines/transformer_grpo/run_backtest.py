@@ -26,6 +26,9 @@ def main() -> None:
     parser.add_argument("--out_dir", type=Path, default=Path("runs/eval"))
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--greedy", action="store_true", help="Disable sampling and pick the top action each day.")
+    parser.add_argument("--top_k", type=int, default=None, help="Override backtest.top_k")
+    parser.add_argument("--hold_threshold", type=float, default=None, help="Override backtest.hold_threshold")
+    parser.add_argument("--min_weight", type=float, default=None, help="Override backtest.min_weight")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -66,6 +69,20 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
+    top_k = int(args.top_k) if args.top_k is not None else int(backtest_cfg.get("top_k", 1))
+    hold_threshold = (
+        args.hold_threshold
+        if args.hold_threshold is not None
+        else backtest_cfg.get("hold_threshold")
+    )
+    if hold_threshold is not None:
+        hold_threshold = float(hold_threshold)
+    min_weight = (
+        args.min_weight
+        if args.min_weight is not None
+        else float(backtest_cfg.get("min_weight", 0.0))
+    )
+
     trades, summary = run_backtest(
         model=model,
         dataset=dataset,
@@ -75,6 +92,9 @@ def main() -> None:
         greedy=args.greedy,
         commission=float(backtest_cfg.get("commission", 0.0)),
         slippage=float(backtest_cfg.get("slippage", 0.0)),
+        top_k=top_k,
+        hold_threshold=hold_threshold,
+        min_weight=min_weight,
     )
 
     out_dir = ensure_dir(args.out_dir)

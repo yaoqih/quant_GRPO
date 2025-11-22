@@ -87,8 +87,12 @@ class GRPOTrainer:
         self.adv_temperature = float(self.train_cfg.get("adv_temperature", 1.0))
         self.clip_range = float(self.train_cfg.get("clip_range", 0.2))
         self.kl_coef = float(self.train_cfg.get("kl_coef", 0.0))
+        self.kl_target = float(self.train_cfg.get("kl_target", 0.0))
+        self.kl_beta = float(self.train_cfg.get("kl_beta", 1.5))
+        self.log_ratio_clip = float(self.train_cfg.get("log_ratio_clip", 5.0))
         self.ref_sync_interval = int(self.train_cfg.get("ref_sync_interval", 0))
         self.ref_sync_alpha = float(self.train_cfg.get("ref_sync_alpha", 1.0))
+        self.turnover_coef = float(self.train_cfg.get("turnover_coef", 0.0))
         self.pretrain_epochs = int(self.train_cfg.get("pretrain_epochs", 0))
         self.pretrain_temperature = float(self.train_cfg.get("pretrain_temperature", 0.1))
         self.greedy_eval = bool(self.train_cfg.get("greedy_eval", True))
@@ -189,6 +193,8 @@ class GRPOTrainer:
         total_reward = 0.0
         total_expected = 0.0
         total_steps = 0
+        total_turnover = 0.0
+        total_realized = 0.0
 
         for step, batch in enumerate(loader, start=1):
             features = batch["features"].to(self.device)
@@ -197,16 +203,25 @@ class GRPOTrainer:
 
             logits, values = self.model(features, mask)
             masked_logits = self._mask_invalid(logits, mask)
-            log_probs = F.log_softmax(masked_logits, dim=-1)
-            probs = log_probs.exp()
-
             mask_f = mask.float()
             count = mask_f.sum(dim=1, keepdim=True).clamp(min=1.0)
+
+            log_probs = F.log_softmax(masked_logits, dim=-1)
+            probs = log_probs.exp()
             expected_reward = ((probs * rewards) * mask_f).sum(dim=-1, keepdim=True) / count
-            centered = (rewards - expected_reward) * mask_f
+
+            if values is not None:
+                baseline = values.detach()
+            else:
+                baseline = expected_reward
+            centered = (rewards - baseline) * mask_f
+            centered = centered - (centered.sum(dim=1, keepdim=True) / count)
             var = (centered ** 2).sum(dim=1, keepdim=True) / count
             std = torch.sqrt(var + 1e-6)
-            advantages = (centered / std).detach()
+            advantages = centered / std
+            if self.adv_temperature != 1.0:
+                advantages = advantages / max(self.adv_temperature, 1e-4)
+            advantages = advantages.detach()
 
             if self.reference_model is not None:
                 with torch.no_grad():
@@ -215,8 +230,11 @@ class GRPOTrainer:
             else:
                 ref_log_probs = log_probs.detach()
 
-            log_ratio = log_probs - ref_log_probs
-            ratio = torch.exp(log_ratio.clamp(min=-20.0, max=20.0))
+            ref_probs = ref_log_probs.exp()
+
+            log_ratio_raw = log_probs - ref_log_probs
+            log_ratio = log_ratio_raw.clamp(min=-self.log_ratio_clip, max=self.log_ratio_clip)
+            ratio = torch.exp(log_ratio)
             clipped_ratio = torch.clamp(ratio, 1.0 - self.clip_range, 1.0 + self.clip_range)
             weighted_adv = ratio * advantages
             clipped_adv = clipped_ratio * advantages
@@ -229,12 +247,23 @@ class GRPOTrainer:
 
             entropy = -(probs * log_probs).masked_select(mask).sum() / mask.sum()
             if self.kl_coef > 0 and self.reference_model is not None:
-                kl = ((probs * (log_probs - ref_log_probs)) * mask).sum(dim=-1)
+                kl = ((probs * log_ratio_raw) * mask_f).sum(dim=-1)
                 kl = kl.sum() / mask.sum()
             else:
                 kl = torch.zeros(1, device=self.device)
 
-            loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy + self.kl_coef * kl
+            turnover_penalty = torch.zeros(1, device=self.device)
+            if self.turnover_coef > 0:
+                prob_delta = torch.abs(probs - ref_probs) * mask_f
+                turnover_penalty = (prob_delta.sum(dim=-1, keepdim=True) / count).mean() * self.turnover_coef
+
+            loss = (
+                policy_loss
+                + self.value_coef * value_loss
+                - self.entropy_coef * entropy
+                + self.kl_coef * kl
+                + turnover_penalty
+            )
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -243,6 +272,14 @@ class GRPOTrainer:
             self.optimizer.step()
             self.global_step += 1
             self._maybe_sync_reference()
+            self._adapt_kl_coef(float(kl.item()))
+
+            with torch.no_grad():
+                normalized = (probs * mask_f).clamp_min(0.0)
+                norm_sum = normalized.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                normalized = normalized / norm_sum
+                actions = torch.multinomial(normalized, num_samples=1)
+                realized = torch.gather(rewards, 1, actions).mean()
 
             total_loss += loss.item()
             total_pg += policy_loss.item()
@@ -251,13 +288,16 @@ class GRPOTrainer:
             total_kl += kl.item()
             total_reward += (rewards.masked_select(mask)).mean().item()
             total_expected += expected_reward.mean().item()
+            total_turnover += turnover_penalty.item()
+            total_realized += realized.item()
             total_steps += 1
 
             if step % self.log_interval == 0:
                 print(
                     f"Epoch {epoch} Step {step} "
                     f"loss={loss.item():.4f} pg={policy_loss.item():.4f} "
-                    f"value={value_loss.item():.4f} entropy={entropy.item():.4f} kl={kl.item():.4f}"
+                    f"value={value_loss.item():.4f} entropy={entropy.item():.4f} "
+                    f"kl={kl.item():.4f} turnover={turnover_penalty.item():.6f}"
                 )
 
         avg = lambda x: x / max(total_steps, 1)
@@ -269,6 +309,8 @@ class GRPOTrainer:
             "kl": avg(total_kl),
             "expected_reward": avg(total_expected),
             "avg_reward": avg(total_reward),
+            "turnover_penalty": avg(total_turnover),
+            "realized_reward": avg(total_realized),
         }
 
     def evaluate(self, dataset: DailyBatchDataset, stage: str, epoch: int) -> Tuple[pd.DataFrame, Dict[str, float]]:
@@ -283,6 +325,13 @@ class GRPOTrainer:
             greedy=self.greedy_eval,
             commission=float(self.backtest_cfg.get("commission", 0.0)),
             slippage=float(self.backtest_cfg.get("slippage", 0.0)),
+            top_k=int(self.backtest_cfg.get("top_k", 1)),
+            hold_threshold=(
+                float(self.backtest_cfg.get("hold_threshold"))
+                if self.backtest_cfg.get("hold_threshold") is not None
+                else None
+            ),
+            min_weight=float(self.backtest_cfg.get("min_weight", 0.0)),
         )
         stage_dir = ensure_dir(self.work_dir / stage)
         save_trades(trades, stage_dir / f"{stage}_trades.csv")
@@ -383,6 +432,14 @@ class GRPOTrainer:
             print(f"[Pretrain {epoch}] loss={avg_loss:.4f} policy={avg_policy:.4f} value={avg_value:.4f}")
         self.optimizer = self._build_optimizer()
         self._sync_reference(hard=True)
+
+    def _adapt_kl_coef(self, kl_value: float) -> None:
+        if self.kl_target <= 0 or self.kl_beta <= 1.0:
+            return
+        if kl_value > self.kl_target * 1.5:
+            self.kl_coef = min(self.kl_coef * self.kl_beta, 1.0)
+        elif kl_value < self.kl_target / 1.5:
+            self.kl_coef = max(self.kl_coef / self.kl_beta, 1e-6)
 
 
 def load_config(path: Path) -> Dict:

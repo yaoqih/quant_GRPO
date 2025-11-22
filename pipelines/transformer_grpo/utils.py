@@ -105,8 +105,12 @@ def compute_performance(trades: pd.DataFrame, risk_free: float = 0.02) -> Dict[s
     max_dd = float(np.max(drawdown))
 
     hit_ratio = float((daily_returns > 0).mean())
-    switches = trades["instrument"].ne(trades["instrument"].shift()).sum()
-    switch_ratio = float((switches / trading_days) if trading_days else 0.0)
+    avg_turnover = float(trades["turnover"].mean()) if "turnover" in trades else 0.0
+    if avg_turnover > 0:
+        switch_ratio = avg_turnover
+    else:
+        switches = trades["instrument"].ne(trades["instrument"].shift()).sum()
+        switch_ratio = float((switches / trading_days) if trading_days else 0.0)
 
     return {
         "cumulative_return": total_return,
@@ -116,4 +120,5 @@ def compute_performance(trades: pd.DataFrame, risk_free: float = 0.02) -> Dict[s
         "hit_ratio": hit_ratio,
         "avg_daily_return": mean_daily,
         "switch_ratio": switch_ratio,
+        "avg_turnover": avg_turnover,
     }

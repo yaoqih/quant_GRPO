@@ -19,12 +19,13 @@
      --config pipelines/transformer_grpo/config_cn_t1.yaml
    ```
    - 训练日志、指标与模型 `state_dict` 将保存到 `runs/transformer_grpo/<timestamp>/`。
-4. 使用已保存的 checkpoint 回测指定时间段
+4. 使用已保存的 checkpoint 回测指定时间段（可选 top-k、多仓/持仓阈值等）
    ```bash
-   python -m pipelines.transformer_grpo.c \
+   python -m pipelines.transformer_grpo.run_backtest \
      --config pipelines/transformer_grpo/config_cn_t1.yaml \
      --checkpoint runs/transformer_grpo/<timestamp>/best.pt \
-     --segment test --out_dir runs/eval/test
+     --segment test --out_dir runs/eval/test \
+     --top_k 3 --hold_threshold 0.45 --min_weight 0.05
    ```
 
 > 数据仍在下载时，可以先修改配置、熟悉 workflow；训练脚本会在检测到 segment 为空时直接报错，避免误跑。
@@ -37,15 +38,15 @@
 
 - `pipelines/transformer_grpo/model.py`
   - `TransformerPolicy`：跨截面的 Transformer Encoder，将同一交易日所有股票特征视作 token，产生 action logits 与 value 估计。
-  - `act` 方法支持温度采样与贪婪决策，方便在线交易或随机策略对比。
+  - `act` 方法支持温度采样与贪婪决策，可输出用于 top-k 组合构建的概率分布。
 
 - `pipelines/transformer_grpo/trainer.py`
-  - `GRPOTrainer` 将 GRPO（群体相对优势）目标与 value baseline、entropy bonus 组合，形成强化学习式的损失函数。
+  - `GRPOTrainer` 将 GRPO（群体相对优势）目标与 value baseline、entropy bonus 组合，形成强化学习式损失；新版默认启用 critic baseline、log-ratio 限幅、KL 自适应调节与 turnover 惩罚，整体更加稳定。
   - 自动创建工作目录、保存配置、周期性评估，并在验证集上基于 Sharpe（默认可在配置中修改）挑选最佳模型。
 
 - `pipelines/transformer_grpo/backtest.py` & `run_backtest.py`
-  - `run_policy_on_dataset` 顺序遍历 `DailyBatch`，模拟“收盘决策->次日调仓”策略，输出逐日交易记录。
-  - `run_backtest` 汇总收益率、净值曲线，`compute_performance` 计算累计收益、年化、Sharpe、最大回撤、胜率等指标，并以 CSV/JSON 的形式落盘。
+  - `run_policy_on_dataset` 顺序遍历 `DailyBatch`，根据模型输出的跨截面分布构建 top-k 权重组合，可配置最低权重、持仓阈值维持前一日头寸，同时依据组合换手计提佣金/滑点。
+  - `run_backtest` 汇总收益率、净值曲线，`compute_performance` 计算累计收益、年化、Sharpe、最大回撤、胜率、换手等指标，并以 CSV/JSON 的形式落盘。命令行参数 `--top_k/--hold_threshold/--min_weight` 可覆盖配置。
 
 ## 配置说明
 
@@ -58,8 +59,8 @@
   - `label` 表达式默认是 “次日开盘/前日开盘 - 1”，符合 T+1 换仓逻辑；若需要用次日收盘收益或包含手续费，只要修改 Label 表达式即可。pipelines 会读取 handler 配置里的 `label` 列表尝试匹配返回的列名，若无法匹配则退回到首列，也可在 `label_name` 中手动指定。
   - `min_instruments` / `max_instruments` 控制每日候选股票上限，避免在超大股票池上训练导致显存不足。
 - `model`: Transformer 结构超参。
-- `training`: GRPO 训练参数（学习率、熵系数、温度、监控指标等），以及输出目录。
-- `backtest`: 提供默认的回测段落及交易成本假设，`run_backtest.py` 会读取这里的风险自由率等信息。
+- `training`: GRPO 训练参数（学习率、熵系数、温度、监控指标等），以及输出目录。新增 `log_ratio_clip`、`kl_target/kl_beta`（自适应 KL）、`turnover_coef` 等字段，用于控制 PPO 稳定性和换手惩罚。
+- `backtest`: 提供默认的回测段落及交易成本假设（`commission/slippage`），同时支持 `top_k`、`hold_threshold`、`min_weight` 等多仓配置；`run_backtest.py` 可在命令行覆盖这些值。
 
 ## 下一步可以做什么
 
