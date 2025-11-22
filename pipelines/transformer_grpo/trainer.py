@@ -17,12 +17,7 @@ import qlib
 from .backtest import run_backtest, save_trades
 from .data_pipeline import DailyBatchDataset, DailyBatchFactory
 from .model import TransformerPolicy
-from .utils import (
-    collate_daily_batches,
-    compute_group_advantage,
-    ensure_dir,
-    set_global_seed,
-)
+from .utils import collate_daily_batches, ensure_dir, set_global_seed
 
 
 class GRPOTrainer:
@@ -192,6 +187,7 @@ class GRPOTrainer:
         total_entropy = 0.0
         total_kl = 0.0
         total_reward = 0.0
+        total_expected = 0.0
         total_steps = 0
 
         for step, batch in enumerate(loader, start=1):
@@ -204,13 +200,13 @@ class GRPOTrainer:
             log_probs = F.log_softmax(masked_logits, dim=-1)
             probs = log_probs.exp()
 
-            baseline = values.detach() if values is not None else None
-            advantages = compute_group_advantage(
-                rewards,
-                mask,
-                temperature=self.adv_temperature,
-                baseline=baseline,
-            ).detach()
+            mask_f = mask.float()
+            count = mask_f.sum(dim=1, keepdim=True).clamp(min=1.0)
+            expected_reward = ((probs * rewards) * mask_f).sum(dim=-1, keepdim=True) / count
+            centered = (rewards - expected_reward) * mask_f
+            var = (centered ** 2).sum(dim=1, keepdim=True) / count
+            std = torch.sqrt(var + 1e-6)
+            advantages = (centered / std).detach()
 
             if self.reference_model is not None:
                 with torch.no_grad():
@@ -254,6 +250,7 @@ class GRPOTrainer:
             total_entropy += entropy.item()
             total_kl += kl.item()
             total_reward += (rewards.masked_select(mask)).mean().item()
+            total_expected += expected_reward.mean().item()
             total_steps += 1
 
             if step % self.log_interval == 0:
@@ -270,6 +267,7 @@ class GRPOTrainer:
             "value_loss": avg(total_value),
             "entropy": avg(total_entropy),
             "kl": avg(total_kl),
+            "expected_reward": avg(total_expected),
             "avg_reward": avg(total_reward),
         }
 
