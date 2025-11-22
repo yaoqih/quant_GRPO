@@ -1,0 +1,82 @@
+qlib:
+  provider_uri: ./data/qlib_1d
+  region: cn
+  expression_cache: null
+  dataset_cache: null
+
+data:
+  handler:
+    class: Alpha360
+    module_path: qlib.contrib.data.handler
+    kwargs:
+      instruments: csi300
+      start_time: 2007-01-01
+      end_time: 2024-01-01
+      fit_start_time: 2007-01-01
+      fit_end_time: 2015-12-31
+      freq: day
+      infer_processors:
+        - class: RobustZScoreNorm
+          kwargs:
+            fields_group: feature
+            clip_outlier: true
+        - class: Fillna
+          kwargs:
+            fields_group: feature
+      learn_processors:
+        - class: DropnaLabel
+        - class: CSRankNorm
+          kwargs:
+            fields_group: label
+      label:
+        - "Ref($open, -1) / Ref($open, -2) - 1"
+  segments:
+    train: ["2010-01-01", "2016-12-31"]
+    valid: ["2017-01-01", "2018-12-31"]
+    test: ["2019-01-01", "2020-09-25"]
+  feature_group: feature
+  label_group: label
+  label_name: null
+  min_instruments: 30
+  max_instruments: 500
+  reward:
+    clip: [-0.15, 0.15]
+    scale: 1.0
+
+model:
+  d_model: 128
+  nhead: 4
+  num_layers: 3
+  dropout: 0.1
+  ff_multiplier: 4
+  use_value_head: true
+
+training:
+  seed: 42
+  device: auto
+  epochs: 60
+  batch_size: 32
+  learning_rate: 0.0003
+  weight_decay: 0.0
+  entropy_coef: 0.01
+  value_coef: 0.5
+  grad_clip: 1.0
+  adv_temperature: 1.0
+  clip_range: 0.2
+  kl_coef: 0.01
+  ref_sync_interval: 200
+  ref_sync_alpha: 1.0
+  pretrain_epochs: 5
+  pretrain_temperature: 0.1
+  eval_temperature: 0.8
+  greedy_eval: true
+  risk_free: 0.02
+  checkpoint_root: runs/transformer_grpo
+  log_interval: 25
+  monitor: sharpe
+  num_workers: 0
+
+backtest:
+  segment: test
+  commission: 0.0
+  slippage: 0.0

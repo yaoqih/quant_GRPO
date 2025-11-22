@@ -1,0 +1,42 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Train Transformer GRPO",
+            "type": "debugpy", 
+            "request": "launch",
+            "module": "pipelines.transformer_grpo.trainer",
+            "args": [
+                "--config",
+                "pipelines/transformer_grpo/config_cn_t1.yaml"
+            ],
+            "cwd": "${workspaceFolder}",
+            "justMyCode": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0" 
+            }
+        },
+        {
+            "name": "backtest",
+            "type": "debugpy", 
+            "request": "launch",
+            "module": "pipelines.transformer_grpo.run_backtest",
+            "args": [
+                "--config",
+                "pipelines/transformer_grpo/config_cn_t1.yaml",
+                "--checkpoint",
+                "runs/transformer_grpo/20251122_161550/best.pt",
+                "--segment",
+                "test",
+                "--out_dir",
+                "runs/eval/test"
+
+            ],
+            "cwd": "${workspaceFolder}",
+            "justMyCode": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0" 
+            }
+        },
+    ]
+}
