@@ -6,13 +6,13 @@ qlib:
 
 data:
   handler:
-    class: Alpha360
+    class: Alpha158
     module_path: qlib.contrib.data.handler
     kwargs:
       instruments: csi300
-      start_time: 2007-01-01
+      start_time: 2001-01-01
       end_time: 2024-01-01
-      fit_start_time: 2007-01-01
+      fit_start_time: 2001-01-01
       fit_end_time: 2015-12-31
       freq: day
       infer_processors:
@@ -31,7 +31,7 @@ data:
       label:
         - "Ref($open, -1) / Ref($open, -2) - 1"
   segments:
-    train: ["2010-01-01", "2016-12-31"]
+    train: ["2001-01-01", "2016-12-31"]
     valid: ["2017-01-01", "2018-12-31"]
     test: ["2019-01-01", "2020-09-25"]
   feature_group: feature
@@ -40,8 +40,18 @@ data:
   min_instruments: 30
   max_instruments: 500
   reward:
-    clip: [-0.15, 0.15]
+    clip: [-0.08, 0.08]
     scale: 1.0
+  augment:
+    temporal_span: 20
+    instrument_embedding_dim: 32
+    include_cash_token: true
+    cash_return: 0.0
+    cash_feature_value: 0.0
+    cash_token: "CASH"
+  walk_forward_segments:
+    wf_2014_15: ["2014-01-01", "2015-12-31"]
+    wf_2016_17: ["2016-01-01", "2017-12-31"]
 
 model:
   d_model: 512
@@ -54,8 +64,8 @@ model:
 training:
   seed: 42
   device: auto
-  epochs: 60
-  batch_size: 64
+  epochs: 40
+  batch_size: 16
   learning_rate: 0.0001
   weight_decay: 0.0
   entropy_coef: 0.01
@@ -69,21 +79,41 @@ training:
   log_ratio_clip: 4.0
   ref_sync_interval: 64
   ref_sync_alpha: 0.1
+  turnover_quad_coef: 0.0005
+  drawdown_coef: 0.05
+  volatility_coef: 0.01
+  max_drawdown_target: 0.7
+  early_stop_patience: 10
+  nav_window: 32
   pretrain_epochs: 5
   pretrain_temperature: 0.1
   eval_temperature: 0.8
   greedy_eval: true
   risk_free: 0.02
   checkpoint_root: runs/transformer_grpo
-  log_interval: 25
+  log_interval: 200
   monitor: sharpe
-  num_workers: 0
+  num_workers: 8
   turnover_coef: 0.001
+  use_cosine_lr: true
+  ema_decay: 0.995
+  eval_with_ema: true
+  transaction_cost: 0.003
+  chronological_batches: true
+  logger:
+    type: wandb  # set to "wandb" or "tensorboard" to enable live logging
+    project: transformer_grpo
+    run_name: null
+    mode: online
+    log_trades: false
+    tags: []
 
 backtest:
   segment: test
-  commission: 0.0005
-  slippage: 0.0005
-  top_k: 3
+  commission: 0.0015
+  slippage: 0.0015
+  top_k: 1
   hold_threshold: 0.45
   min_weight: 0.05
+  cash_token: "CASH"
+  max_gross_exposure: 1.0

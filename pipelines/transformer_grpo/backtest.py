@@ -69,6 +69,8 @@ def run_policy_on_dataset(
     top_k: int = 1,
     hold_threshold: Optional[float] = None,
     min_weight: float = 0.0,
+    cash_token: Optional[str] = None,
+    max_gross_exposure: float = 1.0,
 ) -> pd.DataFrame:
     model.eval()
     records = []
@@ -92,8 +94,20 @@ def run_policy_on_dataset(
                 prev_weights=prev_weights,
                 hold_threshold=hold_threshold,
             )
-            rewards_map = {inst: float(batch.rewards[idx]) for idx, inst in enumerate(batch.instruments[:valid_len])}
+            rewards_map = {
+                inst: float(batch.rewards[idx]) for idx, inst in enumerate(batch.instruments[:valid_len])
+            }
             logits_map = {inst: float(logits[0, idx].item()) for idx, inst in enumerate(batch.instruments[:valid_len])}
+            total_weight = sum(weights.values())
+            limit = max(max_gross_exposure, 1e-6)
+            if total_weight > limit:
+                scale = limit / total_weight
+                weights = {inst: weight * scale for inst, weight in weights.items()}
+                total_weight = limit
+            if cash_token is not None and cash_token in rewards_map:
+                residual = max(limit - total_weight, 0.0)
+                if residual > 0:
+                    weights[cash_token] = weights.get(cash_token, 0.0) + residual
             weighted_reward = sum(weights.get(inst, 0.0) * rewards_map.get(inst, 0.0) for inst in weights)
             portfolio_score = sum(weights.get(inst, 0.0) * logits_map.get(inst, 0.0) for inst in weights)
             turnover = _compute_turnover(prev_weights, weights)
@@ -132,6 +146,8 @@ def run_backtest(
     top_k: int = 1,
     hold_threshold: Optional[float] = None,
     min_weight: float = 0.0,
+    cash_token: Optional[str] = None,
+    max_gross_exposure: float = 1.0,
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
     trades = run_policy_on_dataset(
         model=model,
@@ -144,6 +160,8 @@ def run_backtest(
         top_k=top_k,
         hold_threshold=hold_threshold,
         min_weight=min_weight,
+        cash_token=cash_token,
+        max_gross_exposure=max_gross_exposure,
     )
     summary = compute_performance(trades, risk_free=risk_free)
     return trades, summary

@@ -44,11 +44,18 @@ class TransformerPolicy(nn.Module):
         ff_multiplier: int = 4,
         max_positions: int = 1024,
         use_value_head: bool = True,
+        temporal_span: int = 1,
     ):
         super().__init__()
         self.feature_dim = feature_dim
         self.d_model = d_model
-        self.input_layer = nn.Linear(feature_dim, d_model)
+        self.temporal_span = max(int(temporal_span), 1)
+        self.feature_proj = nn.Linear(feature_dim, d_model)
+        self.temporal_encoder = nn.GRU(
+            input_size=d_model,
+            hidden_size=d_model,
+            batch_first=True,
+        )
         self.pos_encoder = PositionalEncoding(d_model, max_len=max_positions, dropout=dropout)
         self.layer_norm = nn.LayerNorm(d_model)
         self.batch_first = True
@@ -77,11 +84,19 @@ class TransformerPolicy(nn.Module):
         Parameters
         ----------
         features : torch.Tensor
-            Shape (batch_size, instruments, feature_dim) if batch_first is supported otherwise (instruments, batch, dim).
+            Shape (batch_size, instruments, temporal_span, feature_dim) for temporal training,
+            or (batch_size, instruments, feature_dim) for legacy single-step inputs.
         mask : torch.Tensor, optional
             Boolean mask with True for valid instruments.
         """
-        x = self.input_layer(features)
+        if features.dim() == 4:
+            batch, instruments, timesteps, _ = features.shape
+            projected = self.feature_proj(features)
+            temporal_input = projected.view(batch * instruments, timesteps, self.d_model)
+            temporal_encoded, _ = self.temporal_encoder(temporal_input)
+            x = temporal_encoded[:, -1, :].view(batch, instruments, self.d_model)
+        else:
+            x = self.feature_proj(features)
         x = self.layer_norm(x)
         x = self.pos_encoder(x)
 

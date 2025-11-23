@@ -31,16 +31,25 @@ def collate_daily_batches(samples: List[DailyBatch]) -> Dict[str, object]:
         raise ValueError("Empty batch.")
     batch_size = len(samples)
     max_tokens = max(s.features.shape[0] for s in samples)
-    feature_dim = samples[0].features.shape[1]
+    first_feat = samples[0].features
+    if first_feat.ndim == 3:
+        temporal_span = first_feat.shape[1]
+        feature_dim = first_feat.shape[2]
+    else:
+        temporal_span = 1
+        feature_dim = first_feat.shape[1]
 
-    features = torch.zeros(batch_size, max_tokens, feature_dim, dtype=torch.float32)
+    features = torch.zeros(batch_size, max_tokens, temporal_span, feature_dim, dtype=torch.float32)
     rewards = torch.zeros(batch_size, max_tokens, dtype=torch.float32)
     mask = torch.zeros(batch_size, max_tokens, dtype=torch.bool)
     metadata: List[Dict[str, object]] = []
 
     for idx, sample in enumerate(samples):
         length = sample.features.shape[0]
-        features[idx, :length] = torch.from_numpy(sample.features)
+        feat = sample.features
+        if feat.ndim == 2:
+            feat = feat[:, np.newaxis, :]
+        features[idx, :length] = torch.from_numpy(feat)
         rewards[idx, :length] = torch.from_numpy(sample.rewards)
         mask[idx, :length] = True
         metadata.append(

@@ -12,6 +12,7 @@ from .data_pipeline import DailyBatchFactory
 from .model import TransformerPolicy
 from .trainer import load_config
 from .utils import ensure_dir
+import os
 
 
 def main() -> None:
@@ -21,7 +22,7 @@ def main() -> None:
         type=Path,
         default=Path("pipelines/transformer_grpo/config_cn_t1.yaml"),
     )
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--segment", type=str, default=None)
     parser.add_argument("--out_dir", type=Path, default=Path("runs/eval"))
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -29,9 +30,20 @@ def main() -> None:
     parser.add_argument("--top_k", type=int, default=None, help="Override backtest.top_k")
     parser.add_argument("--hold_threshold", type=float, default=None, help="Override backtest.hold_threshold")
     parser.add_argument("--min_weight", type=float, default=None, help="Override backtest.min_weight")
+    parser.add_argument("--cash_token", type=str, default=None, help="Override backtest.cash_token")
+    parser.add_argument(
+        "--max_gross_exposure",
+        type=float,
+        default=None,
+        help="Override backtest.max_gross_exposure",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if args.checkpoint is None:
+        checkpoint=os.listdir(cfg['training']['checkpoint_root'][-1]/'best.pt')
+        if not os.path.exists():
+            raise ValueError("Must specify a checkpoint with --checkpoint")
     qlib.init(**cfg.get("qlib", {}))
     backtest_cfg = cfg.get("backtest", {})
     segment = args.segment or backtest_cfg.get("segment", "test")
@@ -56,6 +68,7 @@ def main() -> None:
         reward_clip=reward_clip,
         reward_scale=float(cfg["data"].get("reward", {}).get("scale", 1.0)),
         instrument_universe=cfg["data"].get("instrument_universe"),
+        augment=cfg["data"].get("augment"),
     )
 
     dataset = factory.build_segment(segment)
@@ -82,6 +95,12 @@ def main() -> None:
         if args.min_weight is not None
         else float(backtest_cfg.get("min_weight", 0.0))
     )
+    cash_token = args.cash_token if args.cash_token is not None else backtest_cfg.get("cash_token")
+    max_gross_exposure = (
+        args.max_gross_exposure
+        if args.max_gross_exposure is not None
+        else float(backtest_cfg.get("max_gross_exposure", 1.0))
+    )
 
     trades, summary = run_backtest(
         model=model,
@@ -95,6 +114,8 @@ def main() -> None:
         top_k=top_k,
         hold_threshold=hold_threshold,
         min_weight=min_weight,
+        cash_token=cash_token,
+        max_gross_exposure=max_gross_exposure,
     )
 
     out_dir = ensure_dir(args.out_dir)
