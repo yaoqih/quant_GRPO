@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import torch
 
@@ -80,10 +81,12 @@ def run_policy_on_dataset(
 
     with torch.no_grad():
         for batch in dataset:
-            features = torch.from_numpy(batch.features).unsqueeze(0).to(device)
-            mask = torch.ones(1, batch.features.shape[0], dtype=torch.bool, device=device)
+            feat_np, reward_np = batch.materialize()
+            features = torch.from_numpy(feat_np.astype(np.float32, copy=False)).unsqueeze(0).to(device)
+            token_count = feat_np.shape[0]
+            mask = torch.ones(1, token_count, dtype=torch.bool, device=device)
             action, probs, logits = model.act(features, mask, temperature=temperature, greedy=greedy)
-            valid_len = batch.features.shape[0]
+            valid_len = token_count
             probs_np = probs[0, :valid_len].detach().cpu().tolist()
             probs_np = _normalize_vector(probs_np)
             inst_probs = {inst: float(prob) for inst, prob in zip(batch.instruments[:valid_len], probs_np)}
@@ -94,9 +97,7 @@ def run_policy_on_dataset(
                 prev_weights=prev_weights,
                 hold_threshold=hold_threshold,
             )
-            rewards_map = {
-                inst: float(batch.rewards[idx]) for idx, inst in enumerate(batch.instruments[:valid_len])
-            }
+            rewards_map = {inst: float(reward_np[idx]) for idx, inst in enumerate(batch.instruments[:valid_len])}
             logits_map = {inst: float(logits[0, idx].item()) for idx, inst in enumerate(batch.instruments[:valid_len])}
             total_weight = sum(weights.values())
             limit = max(max_gross_exposure, 1e-6)

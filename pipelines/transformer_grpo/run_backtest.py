@@ -69,6 +69,8 @@ def main() -> None:
         reward_scale=float(cfg["data"].get("reward", {}).get("scale", 1.0)),
         instrument_universe=cfg["data"].get("instrument_universe"),
         augment=cfg["data"].get("augment"),
+        cache_config=cfg["data"].get("cache"),
+        feature_dtype=cfg["data"].get("feature_dtype", "float32"),
     )
 
     dataset = factory.build_segment(segment)

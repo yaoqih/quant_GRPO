@@ -62,6 +62,8 @@
   - `label` 表达式默认是 “次日开盘/前日开盘 - 1”，符合 T+1 换仓逻辑；若需要用次日收盘收益或包含手续费，只要修改 Label 表达式即可。pipelines 会读取 handler 配置里的 `label` 列表尝试匹配返回的列名，若无法匹配则退回到首列，也可在 `label_name` 中手动指定。
   - `min_instruments` / `max_instruments` 控制每日候选股票上限，避免在超大股票池上训练导致显存不足。
   - `augment` 块用于控制特征增强（滚动窗口、滞后特征、未来收益 proxy、embedding、现金 token 等）；`walk_forward_segments` 可额外指定回测窗口用于训练结束后的 walk-forward 分析。
+  - `feature_dtype` 用于设置 `DailyBatch` 在内存中的精度（例如 `float16` 可把样本缓存占用直接减半，collate 时仍会转成 `float32` 喂入模型）。
+  - `cache` 块可开启按日落盘缓存：启用后每日的截面样本会序列化到 `cache.root/<segment>/<date>.npz`，训练过程中按需读取，避免一次性把所有交易日加载到内存。`reuse_existing` 会在配置一致（包含 handler 归一化参数、增强设置、dtype 等都哈希签名校验）时直接复用已有缓存；`force_refresh` 可在需要重建缓存时显式清空。可通过 `compress` 控制是否使用 `np.savez_compressed`，如需进一步减小体积可配合 `feature_dtype: float16`。
 - `model`: Transformer 结构超参。
 - `training`: GRPO 训练参数（学习率、熵系数、温度、监控指标等），以及输出目录。新增 `log_ratio_clip`、`kl_target/kl_beta`（自适应 KL）、`turnover_coef/turnover_quad_coef`、`drawdown_coef`、`volatility_coef`、`max_drawdown_target`、`early_stop_patience`、`use_cosine_lr`、`ema_decay`、`eval_with_ema` 等字段，用于控制 PPO 稳定性、风险偏好及训练日程。
 - `backtest`: 提供默认的回测段落及交易成本假设（`commission/slippage`），同时支持 `top_k`、`hold_threshold`、`min_weight`、`cash_token`、`max_gross_exposure` 等多仓配置；`run_backtest.py` 可在命令行覆盖这些值。

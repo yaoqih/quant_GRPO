@@ -14,19 +14,36 @@ class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 1024, dropout: float = 0.0):
         super().__init__()
         self.dropout = nn.Dropout(dropout)
-
-        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model)
+        self.d_model = d_model
+        self.register_buffer(
+            "pe",
+            self._generate_pe(max_len, device=torch.device("cpu")).unsqueeze(0),
+            persistent=False,
         )
-        pe = torch.zeros(max_len, d_model, dtype=torch.float32)
+
+    def _generate_pe(self, length: int, device: torch.device) -> torch.Tensor:
+        position = torch.arange(0, length, dtype=torch.float32, device=device).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, self.d_model, 2, dtype=torch.float32, device=device)
+            * (-math.log(10000.0) / self.d_model)
+        )
+        pe = torch.zeros(length, self.d_model, dtype=torch.float32, device=device)
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
+        return pe
+
+    def _extend_pe(self, length: int, device: torch.device) -> None:
+        new_pe = self._generate_pe(length, device=device).unsqueeze(0)
+        self.pe = new_pe
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         length = x.size(1)
-        x = x + self.pe[:, :length]
+        if length > self.pe.size(1):
+            self._extend_pe(length, device=x.device)
+        pe_slice = self.pe[:, :length]
+        if pe_slice.device != x.device:
+            pe_slice = pe_slice.to(x.device)
+        x = x + pe_slice
         return self.dropout(x)
 
 

@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import yaml
 import qlib
+from tqdm import tqdm
 
 from .backtest import run_backtest, save_trades
 from .data_pipeline import DailyBatchDataset, DailyBatchFactory
@@ -67,6 +68,8 @@ class GRPOTrainer:
             reward_scale=float(self.data_cfg.get("reward", {}).get("scale", 1.0)),
             instrument_universe=self.data_cfg.get("instrument_universe"),
             augment=self.data_cfg.get("augment"),
+            cache_config=self.data_cfg.get("cache"),
+            feature_dtype=self.data_cfg.get("feature_dtype", "float32"),
         )
 
         self.train_dataset = self.data_factory.build_segment("train")
@@ -604,7 +607,7 @@ class GRPOTrainer:
             total_value = 0.0
             steps = 0
             self.model.train()
-            for batch in loader:
+            for batch in tqdm(loader,desc=f"[Pretrain] training epoch {epoch}"):
                 features = batch["features"].to(self.device)
                 rewards = batch["rewards"].to(self.device)
                 mask = batch["mask"].to(self.device)

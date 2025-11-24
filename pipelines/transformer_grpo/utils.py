@@ -4,7 +4,7 @@ import math
 import os
 import random
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -30,14 +30,15 @@ def collate_daily_batches(samples: List[DailyBatch]) -> Dict[str, object]:
     if not samples:
         raise ValueError("Empty batch.")
     batch_size = len(samples)
-    max_tokens = max(s.features.shape[0] for s in samples)
-    first_feat = samples[0].features
-    if first_feat.ndim == 3:
-        temporal_span = first_feat.shape[1]
-        feature_dim = first_feat.shape[2]
+    sample_shapes = [_infer_sample_shape(sample) for sample in samples]
+    max_tokens = max(shape[0] for shape in sample_shapes)
+    first_shape = sample_shapes[0]
+    if len(first_shape) == 3:
+        temporal_span = first_shape[1]
+        feature_dim = first_shape[2]
     else:
         temporal_span = 1
-        feature_dim = first_feat.shape[1]
+        feature_dim = first_shape[1]
 
     features = torch.zeros(batch_size, max_tokens, temporal_span, feature_dim, dtype=torch.float32)
     rewards = torch.zeros(batch_size, max_tokens, dtype=torch.float32)
@@ -45,12 +46,12 @@ def collate_daily_batches(samples: List[DailyBatch]) -> Dict[str, object]:
     metadata: List[Dict[str, object]] = []
 
     for idx, sample in enumerate(samples):
-        length = sample.features.shape[0]
-        feat = sample.features
+        feat, rew = sample.materialize()
+        length = feat.shape[0]
         if feat.ndim == 2:
             feat = feat[:, np.newaxis, :]
-        features[idx, :length] = torch.from_numpy(feat)
-        rewards[idx, :length] = torch.from_numpy(sample.rewards)
+        features[idx, :length] = torch.from_numpy(feat.astype(np.float32, copy=False))
+        rewards[idx, :length] = torch.from_numpy(rew.astype(np.float32, copy=False))
         mask[idx, :length] = True
         metadata.append(
             {
@@ -64,6 +65,15 @@ def collate_daily_batches(samples: List[DailyBatch]) -> Dict[str, object]:
         "mask": mask,
         "meta": metadata,
     }
+
+
+def _infer_sample_shape(sample: DailyBatch) -> Tuple[int, ...]:
+    if sample.feature_shape:
+        return sample.feature_shape
+    if sample.features is not None:
+        return sample.features.shape
+    feat, _ = sample.materialize()
+    return feat.shape
 
 
 def compute_group_advantage(

@@ -1,2 +1,4 @@
-import qlib
-qlib.init(provider_uri='data/qlib_1d')
+import akshare as ak
+
+tool_trade_date_hist_sina_df = ak.tool_trade_date_hist_sina()
+print(tool_trade_date_hist_sina_df)
