@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import os
 import shutil
 from collections import defaultdict, deque
+from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -17,6 +19,61 @@ from qlib.data.dataset.handler import DataHandlerLP
 from qlib.utils import init_instance_by_config
 
 IndexLike = Union[str, pd.Timestamp]
+
+_CACHE_WORKER_OFFSET = 2
+
+
+def _cpu_worker_count(offset: int = _CACHE_WORKER_OFFSET) -> int:
+    try:
+        total = multiprocessing.cpu_count() or 1
+    except NotImplementedError:  # pragma: no cover - platform specific
+        total = 1
+    return max(1, total - max(offset, 0))
+
+
+def _load_cached_batch_worker(date_str: str, meta_path: str, cache_dir: str) -> Optional[Dict[str, Any]]:
+    meta_file = Path(meta_path)
+    if not meta_file.exists():
+        return None
+    try:
+        with meta_file.open("r", encoding="utf-8") as fin:
+            meta = json.load(fin)
+    except Exception:  # noqa: BLE001 - surface as cache miss
+        return None
+    cache_name = meta.get("cache_file") or f"{date_str}.npz"
+    cache_path = Path(cache_dir) / cache_name
+    if not cache_path.exists():
+        return None
+    instruments = meta.get("instruments", [])
+    shape = meta.get("shape", [])
+    return {
+        "date": date_str,
+        "cache_path": str(cache_path),
+        "instruments": instruments,
+        "shape": shape,
+    }
+
+
+def _write_npz_file(directory: str, filename: str, compress: bool, features: np.ndarray, rewards: np.ndarray) -> str:
+    target_dir = Path(directory)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    path = target_dir / filename
+    tmp_path = path.with_suffix(".tmp")
+    save_fn = np.savez_compressed if compress else np.savez
+    with tmp_path.open("wb") as fout:
+        save_fn(fout, features=features, rewards=rewards)
+    os.replace(tmp_path, path)
+    return str(path)
+
+
+@dataclass
+class _PendingCacheWrite:
+    future: Future
+    segment_name: str
+    date: pd.Timestamp
+    instruments: List[str]
+    feature_shape: Tuple[int, ...]
+    cache_file: str
 
 
 @dataclass
@@ -148,6 +205,11 @@ class DailyBatchFactory:
         if self.cache_enabled:
             self.cache_dir = Path(cache_root or "runs/daily_batch_cache")
             self.cache_dir.mkdir(parents=True, exist_ok=True)
+        worker_override = cache_cfg.get("num_workers")
+        if worker_override is not None:
+            self.cache_workers = max(int(worker_override), 1)
+        else:
+            self.cache_workers = _cpu_worker_count()
         self.cache_compress = bool(cache_cfg.get("compress", True))
         self._cache_segment_dirs: Dict[str, Path] = {}
         self.cache_signature = self._build_cache_signature(
@@ -321,49 +383,80 @@ class DailyBatchFactory:
         calendar = manifest.get("calendar", [])
         if not calendar:
             return None
-        batches: List[DailyBatch] = []
+        seg_dir = self._cache_dir_for(segment_name, ensure=False)
+        if seg_dir is None or not seg_dir.exists():
+            return None
+        tasks: List[Tuple[str, str]] = []
         for date_str in calendar:
             date = pd.Timestamp(date_str)
-            meta = self._read_batch_meta(segment_name, date.strftime("%Y%m%d"))
-            if meta is None:
+            meta_path = seg_dir / f"{date.strftime('%Y%m%d')}.meta.json"
+            if not meta_path.exists():
                 return None
-            instruments, shape_arr, cache_path = meta
+            tasks.append((date_str, str(meta_path)))
+        worker_count = max(1, min(self.cache_workers, len(tasks)))
+        result_map: Dict[str, Dict[str, Any]] = {}
+        cache_dir_str = str(seg_dir)
+        with ProcessPoolExecutor(max_workers=worker_count) as pool:
+            futures = {
+                pool.submit(_load_cached_batch_worker, date_str, meta_path, cache_dir_str): date_str
+                for date_str, meta_path in tasks
+            }
+            for future in as_completed(futures):
+                date_key = futures[future]
+                try:
+                    payload = future.result()
+                except Exception:  # noqa: BLE001
+                    return None
+                if payload is None:
+                    return None
+                result_map[date_key] = payload
+        batches: List[DailyBatch] = []
+        for date_str in calendar:
+            payload = result_map.get(date_str)
+            if payload is None:
+                return None
+            date = pd.Timestamp(payload.get("date", date_str))
+            instruments = np.array(payload.get("instruments", []), dtype=object)
+            shape_arr = tuple(int(x) for x in payload.get("shape", []))
+            cache_path = Path(payload["cache_path"])
             batches.append(
                 DailyBatch(
                     date=date,
                     instruments=instruments,
                     features=None,
                     rewards=None,
-                    feature_shape=tuple(shape_arr),
+                    feature_shape=shape_arr,
                     cache_path=cache_path,
                 )
             )
         return batches
 
-    def _store_batch_to_cache(
+    def _finalize_cache_writes(
         self,
-        segment_name: str,
-        date: pd.Timestamp,
-        instruments: np.ndarray,
-        features: np.ndarray,
-        rewards: np.ndarray,
-    ) -> Path:
-        seg_dir = self._cache_dir_for(segment_name)
-        filename = f"{date.strftime('%Y%m%d')}.npz"
-        path = seg_dir / filename
-        tmp_path = path.with_suffix(".tmp")
-        save_fn = np.savez_compressed if self.cache_compress else np.savez
-        with tmp_path.open("wb") as fout:
-            save_fn(fout, features=features, rewards=rewards)
-        os.replace(tmp_path, path)
-        self._write_batch_meta(
-            segment_name=segment_name,
-            date=date,
-            instruments=instruments,
-            feature_shape=tuple(features.shape),
-            cache_file=filename,
-        )
-        return path
+        pending_writes: List[_PendingCacheWrite],
+        executor: ProcessPoolExecutor,
+    ) -> None:
+        error: Optional[RuntimeError] = None
+        for pending in pending_writes:
+            try:
+                pending.future.result()
+            except Exception as exc:  # noqa: BLE001
+                error = RuntimeError(
+                    f"Failed to write cache for segment '{pending.segment_name}' on {pending.date.strftime('%Y-%m-%d')}"
+                )
+                error.__cause__ = exc
+                break
+            instruments = np.array(pending.instruments, dtype=object)
+            self._write_batch_meta(
+                segment_name=pending.segment_name,
+                date=pending.date,
+                instruments=instruments,
+                feature_shape=pending.feature_shape,
+                cache_file=pending.cache_file,
+            )
+        executor.shutdown(wait=True)
+        if error is not None:
+            raise error
 
     def _frame_to_batches(
         self,
@@ -395,100 +488,125 @@ class DailyBatchFactory:
         calendar: List[pd.Timestamp] = []
         feature_dim = len(feature_view.columns)
         buffer_map: Dict[str, deque[np.ndarray]] = defaultdict(lambda: deque(maxlen=self.temporal_span))
+        pending_cache_writes: List[_PendingCacheWrite] = []
+        cache_executor: Optional[ProcessPoolExecutor] = None
+        cache_dir_path: Optional[Path] = None
+        if self.cache_enabled and self.cache_dir is not None:
+            cache_dir_path = self._cache_dir_for(segment_name)
 
-        for date, feature_slice in grouped:
-            label_slice = label_series.xs(date, level="datetime")
-            slice_view = feature_slice.droplevel("datetime") if isinstance(feature_slice.index, pd.MultiIndex) else feature_slice
-            inst_names: List[str] = []
-            inst_features: List[np.ndarray] = []
-            inst_rewards: List[float] = []
+        try:
+            for date, feature_slice in grouped:
+                current_date = pd.Timestamp(date)
+                label_slice = label_series.xs(date, level="datetime")
+                slice_view = feature_slice.droplevel("datetime") if isinstance(feature_slice.index, pd.MultiIndex) else feature_slice
+                inst_names: List[str] = []
+                inst_features: List[np.ndarray] = []
+                inst_rewards: List[float] = []
 
-            for inst, row in slice_view.iterrows():
-                inst_key = str(inst)
-                buf = buffer_map[inst_key]
-                buf.append(row.to_numpy(dtype=np.float32))
-                if len(buf) < self.temporal_span:
+                for inst, row in slice_view.iterrows():
+                    inst_key = str(inst)
+                    buf = buffer_map[inst_key]
+                    buf.append(row.to_numpy(dtype=np.float32))
+                    if len(buf) < self.temporal_span:
+                        continue
+                    reward_val = label_slice.get(inst, np.nan)
+                    if pd.isna(reward_val):
+                        continue
+                    inst_names.append(inst_key)
+                    inst_features.append(np.stack(buf, axis=0))
+                    inst_rewards.append(float(reward_val))
+
+                if not inst_names:
                     continue
-                reward_val = label_slice.get(inst, np.nan)
-                if pd.isna(reward_val):
+
+                instruments = np.array(inst_names, dtype=object)
+                features = np.stack(inst_features).astype(self.feature_dtype, copy=False)
+                rewards = np.array(inst_rewards, dtype=np.float32)
+
+                if self.instrument_universe is not None:
+                    mask = np.isin(instruments, list(self.instrument_universe))
+                    if not mask.any():
+                        continue
+                    instruments = instruments[mask]
+                    features = features[mask]
+                    rewards = rewards[mask]
+
+                if len(instruments) < self.min_instruments:
                     continue
-                inst_names.append(inst_key)
-                inst_features.append(np.stack(buf, axis=0))
-                inst_rewards.append(float(reward_val))
 
-            if not inst_names:
-                continue
+                if self.max_instruments and len(instruments) > self.max_instruments:
+                    features = features[: self.max_instruments]
+                    rewards = rewards[: self.max_instruments]
+                    instruments = instruments[: self.max_instruments]
 
-            instruments = np.array(inst_names, dtype=object)
-            features = np.stack(inst_features).astype(self.feature_dtype, copy=False)
-            rewards = np.array(inst_rewards, dtype=np.float32)
+                if self.reward_clip is not None:
+                    low, high = self.reward_clip
+                    rewards = np.clip(rewards, low, high)
+                if self.reward_scale != 1.0:
+                    rewards = rewards * self.reward_scale
 
-            if self.instrument_universe is not None:
-                mask = np.isin(instruments, list(self.instrument_universe))
-                if not mask.any():
-                    continue
-                instruments = instruments[mask]
-                features = features[mask]
-                rewards = rewards[mask]
+                if self.include_cash_token:
+                    cash_feat = np.full(
+                        (self.temporal_span, feature_dim),
+                        self.cash_feature_value,
+                        dtype=self.feature_dtype,
+                    )
+                    features = np.vstack([features, cash_feat[np.newaxis, ...]])
+                    rewards = np.concatenate([rewards, np.array([self.cash_return], dtype=np.float32)])
+                    instruments = np.concatenate([instruments, np.array([self.cash_token_name], dtype=object)])
 
-            if len(instruments) < self.min_instruments:
-                continue
+                if self.instrument_emb_dim > 0:
+                    embeddings = np.stack(
+                        [self._get_instrument_embedding(str(inst)) for inst in instruments]
+                    ).astype(self.feature_dtype)
+                    embeddings = np.broadcast_to(
+                        embeddings[:, np.newaxis, :],
+                        (len(instruments), self.temporal_span, self.instrument_emb_dim),
+                    )
+                    features = np.concatenate([features, embeddings], axis=-1)
 
-            if self.max_instruments and len(instruments) > self.max_instruments:
-                features = features[: self.max_instruments]
-                rewards = rewards[: self.max_instruments]
-                instruments = instruments[: self.max_instruments]
+                feature_shape = tuple(features.shape)
+                cache_path: Optional[Path] = None
+                if cache_dir_path is not None:
+                    cache_file = f"{current_date.strftime('%Y%m%d')}.npz"
+                    if cache_executor is None:
+                        cache_executor = ProcessPoolExecutor(max_workers=self.cache_workers)
+                    future = cache_executor.submit(
+                        _write_npz_file,
+                        str(cache_dir_path),
+                        cache_file,
+                        self.cache_compress,
+                        features,
+                        rewards,
+                    )
+                    pending_cache_writes.append(
+                        _PendingCacheWrite(
+                            future=future,
+                            segment_name=segment_name,
+                            date=current_date,
+                            instruments=[str(inst) for inst in instruments],
+                            feature_shape=feature_shape,
+                            cache_file=cache_file,
+                        )
+                    )
+                    cache_path = cache_dir_path / cache_file
+                    features = None
+                    rewards = None
 
-            if self.reward_clip is not None:
-                low, high = self.reward_clip
-                rewards = np.clip(rewards, low, high)
-            if self.reward_scale != 1.0:
-                rewards = rewards * self.reward_scale
-
-            if self.include_cash_token:
-                cash_feat = np.full(
-                    (self.temporal_span, feature_dim),
-                    self.cash_feature_value,
-                    dtype=self.feature_dtype,
+                batches.append(
+                    DailyBatch(
+                        date=current_date,
+                        instruments=instruments,
+                        features=features,
+                        rewards=rewards,
+                        feature_shape=feature_shape,
+                        cache_path=cache_path,
+                    )
                 )
-                features = np.vstack([features, cash_feat[np.newaxis, ...]])
-                rewards = np.concatenate([rewards, np.array([self.cash_return], dtype=np.float32)])
-                instruments = np.concatenate([instruments, np.array([self.cash_token_name], dtype=object)])
-
-            if self.instrument_emb_dim > 0:
-                embeddings = np.stack(
-                    [self._get_instrument_embedding(str(inst)) for inst in instruments]
-                ).astype(self.feature_dtype)
-                embeddings = np.broadcast_to(
-                    embeddings[:, np.newaxis, :],
-                    (len(instruments), self.temporal_span, self.instrument_emb_dim),
-                )
-                features = np.concatenate([features, embeddings], axis=-1)
-
-            feature_shape = tuple(features.shape)
-            cache_path: Optional[Path] = None
-            if self.cache_enabled and self.cache_dir is not None:
-                cache_path = self._store_batch_to_cache(
-                    segment_name,
-                    pd.Timestamp(date),
-                    instruments,
-                    features,
-                    rewards,
-                )
-                features = None
-                rewards = None
-
-            batches.append(
-                DailyBatch(
-                    date=pd.Timestamp(date),
-                    instruments=instruments,
-                    features=features,
-                    rewards=rewards,
-                    feature_shape=feature_shape,
-                    cache_path=cache_path,
-                )
-            )
-            calendar.append(pd.Timestamp(date))
+                calendar.append(current_date)
+        finally:
+            if cache_executor is not None:
+                self._finalize_cache_writes(pending_cache_writes, cache_executor)
         return batches, calendar
 
     def _augment_feature_view(self, feature_view: pd.DataFrame, label_series: pd.Series) -> pd.DataFrame:
