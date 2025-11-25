@@ -4,6 +4,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import re
 import shutil
 from collections import defaultdict, deque
 from concurrent.futures import Future, ProcessPoolExecutor, as_completed
@@ -180,6 +181,9 @@ class DailyBatchFactory:
         self.future_return_horizons = sorted(
             set(int(x) for x in self.augment_cfg.get("future_return_horizons", []))
         )
+        self.label_expressions = _extract_label_expressions(handler_config)
+        self.label_future_lookahead = _infer_label_future_lookahead(self.label_expressions)
+        self.label_safe_shift = max(self.label_future_lookahead + 1, 1)
         self.instrument_emb_dim = int(self.augment_cfg.get("instrument_embedding_dim", 0))
         self.include_cash_token = bool(self.augment_cfg.get("include_cash_token", False))
         self.cash_return = float(self.augment_cfg.get("cash_return", 0.0))
@@ -611,14 +615,18 @@ class DailyBatchFactory:
 
     def _augment_feature_view(self, feature_view: pd.DataFrame, label_series: pd.Series) -> pd.DataFrame:
         frames = [feature_view]
+        safe_label_series = None
+        if self.roll_vol_windows or self.future_return_horizons:
+            # Shift label-derived data far enough into the past so no future price information leaks into features.
+            safe_label_series = label_series.groupby(level="instrument").shift(self.label_safe_shift)
         if self.roll_vol_windows:
-            grouped_label = label_series.groupby(level="instrument")
+            grouped_label = safe_label_series.groupby(level="instrument")
             for window in self.roll_vol_windows:
                 rolled = grouped_label.rolling(window, min_periods=1).std().droplevel(0)
                 shifted = rolled.groupby(level="instrument").shift(1)
                 frames.append(shifted.reindex(feature_view.index).to_frame(name=f"label_std_{window}"))
         if self.future_return_horizons:
-            grouped_label = label_series.groupby(level="instrument")
+            grouped_label = safe_label_series.groupby(level="instrument")
             for horizon in self.future_return_horizons:
                 # Rolling product over past horizon days (include current), then shift forward so each row only sees past info.
                 prod = (1.0 + grouped_label).rolling(horizon, min_periods=horizon).apply(np.prod, raw=True).droplevel(0) - 1.0
@@ -701,6 +709,33 @@ def _infer_label_name_from_config(handler_config: Dict, label_group: str) -> Opt
                 return candidate
     # Some handlers return alias list via `get_label_config`, already handled in data.
     return None
+
+
+def _extract_label_expressions(handler_config: Dict) -> List[str]:
+    if not isinstance(handler_config, dict):
+        return []
+    kwargs = handler_config.get("kwargs", {})
+    label_spec = kwargs.get("label")
+    if isinstance(label_spec, (list, tuple)):
+        if label_spec and isinstance(label_spec[0], str):
+            return list(label_spec)
+        if label_spec and isinstance(label_spec[0], (list, tuple)):
+            return [str(expr) for expr in label_spec[0] if isinstance(expr, str)]
+    return []
+
+
+def _infer_label_future_lookahead(label_expressions: Sequence[str]) -> int:
+    pattern = re.compile(r"Ref\([^,]+,\s*(-?\d+)")
+    max_lookahead = 0
+    for expr in label_expressions:
+        for match in pattern.findall(expr):
+            try:
+                offset = int(match)
+            except ValueError:
+                continue
+            if offset < 0:
+                max_lookahead = max(max_lookahead, abs(offset))
+    return max_lookahead
 
 
 def _flatten_columns(frame: pd.DataFrame) -> pd.DataFrame:

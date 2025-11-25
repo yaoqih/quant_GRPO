@@ -95,6 +95,8 @@ class GRPOTrainer:
             self.model_cfg["temporal_span"] = temporal_span
 
         self.model = TransformerPolicy(feature_dim=feature_dim, **self.model_cfg).to(self.device)
+        self.use_data_parallel = self._should_enable_data_parallel()
+        self.train_model = self._wrap_training_model(self.model)
         self.optimizer = self._build_optimizer()
         self.scheduler = None
         self.entropy_coef = float(self.train_cfg.get("entropy_coef", 0.01))
@@ -196,6 +198,20 @@ class GRPOTrainer:
             drop_last=False,
         )
 
+    def _should_enable_data_parallel(self) -> bool:
+        if self.train_cfg.get("multi_gpu") is False:
+            return False
+        if self.device.type != "cuda":
+            return False
+        return torch.cuda.device_count() > 1
+
+    def _wrap_training_model(self, model: TransformerPolicy) -> torch.nn.Module:
+        if self.use_data_parallel:
+            gpu_count = torch.cuda.device_count()
+            print(f"[Trainer] enabling DataParallel across {gpu_count} GPUs.")
+            return torch.nn.DataParallel(model)
+        return model
+
     def train(self) -> None:
         train_loader = self._build_loader(self.train_dataset, shuffle=not self.chronological_batches)
         epochs = int(self.train_cfg.get("epochs", 20))
@@ -284,7 +300,8 @@ class GRPOTrainer:
             self.logger.close()
 
     def _run_epoch(self, loader: DataLoader, epoch: int) -> Dict[str, float]:
-        self.model.train()
+        train_module = self.train_model
+        train_module.train()
         total_loss = 0.0
         total_pg = 0.0
         total_value = 0.0
@@ -310,7 +327,7 @@ class GRPOTrainer:
             rewards = batch["rewards"].to(self.device)
             mask = batch["mask"].to(self.device)
 
-            logits, values = self.model(features, mask)
+            logits, values = train_module(features, mask)
             masked_logits = self._mask_invalid(logits, mask)
             mask_f = mask.float()
             count = mask_f.sum(dim=1, keepdim=True).clamp(min=1.0)
@@ -600,19 +617,20 @@ class GRPOTrainer:
             return
         loader = self._build_loader(self.train_dataset, shuffle=True)
         temperature = max(self.pretrain_temperature, 1e-3)
+        train_module = self.train_model
         print(f"[Pretrain] start supervised warm-up for {self.pretrain_epochs} epoch(s)")
         for epoch in range(1, self.pretrain_epochs + 1):
             total_loss = 0.0
             total_policy = 0.0
             total_value = 0.0
             steps = 0
-            self.model.train()
+            train_module.train()
             for batch in tqdm(loader,desc=f"[Pretrain] training epoch {epoch}"):
                 features = batch["features"].to(self.device)
                 rewards = batch["rewards"].to(self.device)
                 mask = batch["mask"].to(self.device)
 
-                logits, values = self.model(features, mask)
+                logits, values = train_module(features, mask)
                 masked_logits = self._mask_invalid(logits, mask)
                 log_probs = F.log_softmax(masked_logits, dim=-1)
 

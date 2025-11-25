@@ -109,6 +109,9 @@ class TransformerPolicy(nn.Module):
         if features.dim() == 4:
             batch, instruments, timesteps, _ = features.shape
             projected = self.feature_proj(features)
+            if hasattr(self.temporal_encoder, "flatten_parameters"):
+                # Flatten recurrent weights to keep CUDA kernels happy under multi-GPU replication.
+                self.temporal_encoder.flatten_parameters()
             temporal_input = projected.view(batch * instruments, timesteps, self.d_model)
             temporal_encoded, _ = self.temporal_encoder(temporal_input)
             x = temporal_encoded[:, -1, :].view(batch, instruments, self.d_model)
