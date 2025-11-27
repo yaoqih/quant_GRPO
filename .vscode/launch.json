@@ -25,7 +25,7 @@
                 "--config",
                 "pipelines/transformer_grpo/config_cn_t1.yaml",
                 "--checkpoint",
-                "runs/transformer_grpo/20251123_180122/best.pt",
+                "runs/transformer_grpo/20251125_132216/best.pt",
                 "--segment",
                 "test",
                 "--out_dir",

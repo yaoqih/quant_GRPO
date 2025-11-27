@@ -309,20 +309,30 @@ class DailyBatchFactory:
 
     def _write_segment_manifest(self, segment_name: str, calendar: Sequence[pd.Timestamp]) -> None:
         manifest_path = self._cache_dir_for(segment_name, ensure=True) / "manifest.json"
+        tmp_path = manifest_path.with_suffix(".json.tmp")
         payload = {
             "signature": self.cache_signature,
             "calendar": [pd.Timestamp(ts).strftime("%Y-%m-%d") for ts in calendar],
             "feature_dtype": str(self.feature_dtype),
         }
-        with manifest_path.open("w", encoding="utf-8") as fout:
+        with tmp_path.open("w", encoding="utf-8") as fout:
             json.dump(payload, fout, sort_keys=True)
+        os.replace(tmp_path, manifest_path)
 
     def _load_segment_manifest(self, segment_name: str) -> Optional[Dict]:
         manifest_path = self._segment_manifest_path(segment_name)
         if manifest_path is None or not manifest_path.exists():
             return None
-        with manifest_path.open("r", encoding="utf-8") as fin:
-            manifest = json.load(fin)
+        try:
+            with manifest_path.open("r", encoding="utf-8") as fin:
+                content = fin.read()
+                if not content.strip():
+                    # Empty file, treat as no cache
+                    return None
+                manifest = json.loads(content)
+        except json.JSONDecodeError:
+            # Corrupted cache file, treat as no cache
+            return None
         if manifest.get("signature") != self.cache_signature:
             return None
         return manifest
@@ -350,14 +360,16 @@ class DailyBatchFactory:
         cache_file: str,
     ) -> None:
         meta_path = self._cache_dir_for(segment_name, ensure=True) / f"{date.strftime('%Y%m%d')}.meta.json"
+        tmp_path = meta_path.with_suffix(".json.tmp")
         payload = {
             "date": date.strftime("%Y-%m-%d"),
             "cache_file": cache_file,
             "instruments": [str(inst) for inst in instruments],
             "shape": [int(dim) for dim in feature_shape],
         }
-        with meta_path.open("w", encoding="utf-8") as fout:
+        with tmp_path.open("w", encoding="utf-8") as fout:
             json.dump(payload, fout, sort_keys=True)
+        os.replace(tmp_path, meta_path)
 
     def _read_batch_meta(
         self,
@@ -367,8 +379,14 @@ class DailyBatchFactory:
         meta_path = self._batch_meta_path(segment_name, date_str)
         if meta_path is None or not meta_path.exists():
             return None
-        with meta_path.open("r", encoding="utf-8") as fin:
-            meta = json.load(fin)
+        try:
+            with meta_path.open("r", encoding="utf-8") as fin:
+                content = fin.read()
+                if not content.strip():
+                    return None
+                meta = json.loads(content)
+        except json.JSONDecodeError:
+            return None
         instruments = np.array(meta.get("instruments", []), dtype=object)
         shape = tuple(int(x) for x in meta.get("shape", []))
         cache_name = meta.get("cache_file") or f"{date_str}.npz"
@@ -503,14 +521,27 @@ class DailyBatchFactory:
                 current_date = pd.Timestamp(date)
                 label_slice = label_series.xs(date, level="datetime")
                 slice_view = feature_slice.droplevel("datetime") if isinstance(feature_slice.index, pd.MultiIndex) else feature_slice
+
+                # 向量化优化：一次性处理所有 instruments
+                # 获取所有 instrument 的索引
+                inst_index = slice_view.index
+                n_inst = len(inst_index)
+
+                if n_inst == 0:
+                    continue
+
+                # 将整个 slice 转为 numpy 数组（避免逐行 iterrows）
+                slice_values = slice_view.to_numpy(dtype=np.float32)  # [n_inst, feature_dim]
+
+                # 批量更新 buffer 并收集结果
                 inst_names: List[str] = []
                 inst_features: List[np.ndarray] = []
                 inst_rewards: List[float] = []
 
-                for inst, row in slice_view.iterrows():
+                for idx, inst in enumerate(inst_index):
                     inst_key = str(inst)
                     buf = buffer_map[inst_key]
-                    buf.append(row.to_numpy(dtype=np.float32))
+                    buf.append(slice_values[idx])  # 直接使用预提取的 numpy 数组
                     if len(buf) < self.temporal_span:
                         continue
                     reward_val = label_slice.get(inst, np.nan)
@@ -693,7 +724,7 @@ def _select_group(frame: pd.DataFrame, group: str) -> Union[pd.DataFrame, pd.Ser
     raise KeyError(f"Unable to locate columns for group '{group}'.")
 
 
-def _infer_label_name_from_config(handler_config: Dict, label_group: str) -> Optional[str]:
+def _infer_label_name_from_config(handler_config: Dict, _label_group: str) -> Optional[str]:
     """Best-effort extraction of the label column name from handler config."""
     if not isinstance(handler_config, dict):
         return None
