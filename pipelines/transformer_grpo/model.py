@@ -94,6 +94,9 @@ class TransformerPolicy(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.temporal_span = max(int(temporal_span), 1)
+        
+        # Feature normalization (Batch Norm for stable training)
+        self.feature_norm = nn.BatchNorm1d(feature_dim)
         self.feature_proj = nn.Linear(feature_dim, d_model)
 
         # 时序编码器（有位置编码，因为时间有顺序）
@@ -124,13 +127,21 @@ class TransformerPolicy(nn.Module):
             None: 兼容性占位符
         """
         if features.dim() == 4:
-            batch, instruments, timesteps, _ = features.shape
-            projected = self.feature_proj(features)
+            batch, instruments, timesteps, f_dim = features.shape
+            
+            # Flatten for BatchNorm: [B * N * T, F]
+            flat_features = features.view(-1, f_dim)
+            normed_features = self.feature_norm(flat_features)
+            
+            projected = self.feature_proj(normed_features)
             temporal_input = projected.view(batch * instruments, timesteps, self.d_model)
             temporal_out = self.temporal_encoder(temporal_input)
             x = temporal_out.view(batch, instruments, self.d_model)
         else:
-            x = self.feature_proj(features)
+            batch, instruments, f_dim = features.shape
+            flat_features = features.view(-1, f_dim)
+            normed_features = self.feature_norm(flat_features)
+            x = self.feature_proj(normed_features).view(batch, instruments, self.d_model)
 
         x = self.layer_norm(x)
 

@@ -36,82 +36,130 @@ def compute_topk_weights(
     differentiable: bool = True,
 ) -> torch.Tensor:
     """
-    计算 top-k 权重。
-
-    关键修复：训练时使用完整的softmax让梯度流动，
-    而不是用detach切断梯度。
+    Compute normalized weights for portfolio construction.
 
     Args:
-        logits: [batch, num_instruments] 或 [num_instruments]
-        mask: [batch, num_instruments] 或 [num_instruments]
-        top_k: 选择前 k 个股票
-        temperature: softmax 温度
-        min_weight: 最小权重阈值（仅在推理时生效）
-        differentiable: True=训练模式，False=推理模式
+        logits: [batch, num_instruments]
+        mask: [batch, num_instruments]
+        top_k: Target number of stocks
+        temperature: Softmax temperature
+        min_weight: Minimum weight threshold (inference only)
+        differentiable: If True, uses soft attention. If False, uses hard Top-K.
 
     Returns:
-        weights: 归一化的权重
+        weights: [batch, num_instruments] Normalized weights summing to 1.
     """
+    # Handle 1D input
     squeeze_output = False
     if logits.dim() == 1:
         logits = logits.unsqueeze(0)
         mask = mask.unsqueeze(0)
         squeeze_output = True
 
-    # 清理NaN/Inf
-    logits = torch.where(torch.isfinite(logits), logits, torch.zeros_like(logits))
-
-    # Mask无效位置
+    # Basic masking
     fill_value = -1e9
     masked_logits = logits.masked_fill(~mask, fill_value)
-
-    # 温度缩放
-    effective_temp = max(temperature, 1e-4)
-    scaled = masked_logits / effective_temp
-
-    # 数值稳定的softmax
-    scaled_max = scaled.max(dim=-1, keepdim=True).values
-    scaled = scaled - scaled_max.detach()
-
+    
     if differentiable:
-        # ====== 训练模式 ======
-        # 直接使用softmax，让梯度完整流动到所有位置
-        # 不做hard top-k选择，避免切断梯度
-        probs = F.softmax(scaled, dim=-1)
-        weights = probs * mask.float()
+        # Training: Softmax attention across ALL valid stocks
+        # We generally do NOT enforce strict Top-K here to allow gradient flow to all
+        # valid candidates. The temperature controls concentration.
+        scores = masked_logits / max(temperature, 1e-4)
+        scores = scores - scores.max(dim=-1, keepdim=True).values.detach()
+        weights = F.softmax(scores, dim=-1)
+        weights = weights * mask.float()
     else:
-        # ====== 推理模式 ======
-        # 使用hard top-k选择
-        probs = F.softmax(scaled, dim=-1) * mask.float()
-        k = min(top_k, logits.size(-1))
-
-        if k > 0 and k < logits.size(-1):
-            topk_values, topk_indices = torch.topk(probs, k, dim=-1)
-            weights = torch.zeros_like(probs)
-            weights.scatter_(1, topk_indices, topk_values)
-        else:
-            weights = probs
-
-        # min_weight过滤
+        # Inference: Hard Top-K selection
+        # 1. Calculate probabilities
+        scores = masked_logits / max(temperature, 1e-4)
+        probs = F.softmax(scores, dim=-1)
+        
+        # 2. Select Top-K indices
+        # Handle edge case where K > valid_count
+        valid_count = mask.sum(dim=-1, keepdim=True)
+        k_tensor = torch.min(torch.tensor(top_k, device=logits.device), valid_count).long()
+        
+        # We need a loop or careful broadcasting if K varies per batch (it usually doesn't here)
+        # Assuming constant K for simplicity or taking min across batch
+        eff_k = min(top_k, logits.size(-1))
+        
+        topk_vals, topk_inds = torch.topk(probs, eff_k, dim=-1)
+        
+        # 3. Create hard mask
+        hard_weights = torch.zeros_like(probs)
+        hard_weights.scatter_(1, topk_inds, topk_vals)
+        
+        # 4. Apply Min Weight Filter
         if min_weight > 0:
-            keep_mask = weights >= min_weight
-            if not keep_mask.any(dim=-1).all():
-                # 如果没有权重超过阈值，保留最大的
-                max_idx = weights.argmax(dim=-1, keepdim=True)
-                fallback_mask = torch.zeros_like(keep_mask).scatter_(1, max_idx, True)
-                keep_mask = keep_mask | fallback_mask
-            weights = weights * keep_mask.float()
+            keep = hard_weights >= min_weight
+            # Fallback: if everything filtered, keep max
+            fallback = torch.zeros_like(keep).scatter_(1, hard_weights.argmax(dim=-1, keepdim=True), True)
+            hard_weights = hard_weights * (keep | fallback).float()
+            
+        weights = hard_weights
 
-    # 归一化
-    weights = weights / weights.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-
-    # 最终检查
-    weights = torch.where(torch.isfinite(weights), weights, torch.zeros_like(weights))
-
+    # Normalize
+    sum_w = weights.sum(dim=-1, keepdim=True)
+    weights = weights / sum_w.clamp(min=1e-8)
+    
     if squeeze_output:
         weights = weights.squeeze(0)
-
+        
     return weights
+
+
+def sample_topk_actions(
+    logits: torch.Tensor,
+    mask: torch.Tensor,
+    top_k: int,
+    group_size: int,
+    temperature: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Sample 'group_size' actions for each batch item using Multinomial sampling.
+    Robust version handling K > valid_count.
+    """
+    batch_size, num_inst = logits.shape
+    
+    # Flatten for sampling: [batch * group, num_inst]
+    logits_expanded = logits.unsqueeze(1).expand(-1, group_size, -1)
+    mask_expanded = mask.unsqueeze(1).expand(-1, group_size, -1)
+    
+    logits_flat = logits_expanded.reshape(-1, num_inst)
+    mask_flat = mask_expanded.reshape(-1, num_inst)
+    
+    masked_logits = logits_flat.masked_fill(~mask_flat, -1e9)
+    scores = masked_logits / max(temperature, 1e-4)
+    probs = F.softmax(scores, dim=-1)
+    
+    # Handle variable valid counts across batch
+    # Since torch.multinomial requires fixed num_samples, we set K = min(top_k, min_valid_count)
+    # But wait, if one batch has 5 valid and another 100, we shouldn't limit both to 5.
+    # Solution: Loop or just assume data is dense enough (usually > 300 stocks).
+    # Given Qlib constraint "min_instruments=30", we are safe if top_k=10.
+    # But to be safe, we cap K.
+    
+    valid_counts = mask_flat.sum(dim=1)
+    min_valid = valid_counts.min().item()
+    effective_k = min(top_k, int(min_valid))
+    
+    if effective_k < 1:
+        # Should not happen if min_instruments >= 1
+        # Fallback to taking top 1
+        effective_k = 1
+
+    action_indices = torch.multinomial(probs, num_samples=effective_k, replacement=False)
+    
+    sampled_masks_flat = torch.zeros_like(mask_flat, dtype=torch.bool)
+    sampled_masks_flat.scatter_(1, action_indices, True)
+    
+    # Calculate surrogate log probs
+    log_probs_all = F.log_softmax(scores, dim=-1)
+    selected_log_probs = torch.gather(log_probs_all, 1, action_indices)
+    sample_log_probs = selected_log_probs.sum(dim=-1)
+    
+    return sampled_masks_flat.view(batch_size, group_size, num_inst), sample_log_probs.view(batch_size, group_size)
+
 
 
 def collate_daily_batches(samples: List[DailyBatch]) -> Dict[str, object]:

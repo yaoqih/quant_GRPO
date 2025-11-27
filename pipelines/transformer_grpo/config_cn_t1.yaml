@@ -33,27 +33,27 @@ data:
     test: ["2024-01-01", "2024-12-31"]
   feature_group: feature
   label_group: label
-  feature_dtype: float16
+  feature_dtype: float32
   min_instruments: 30
   max_instruments: 3000
   reward:
     clip: [-0.08, 0.08]
   augment:
-    temporal_span: 20
+    temporal_span: 10
     instrument_embedding_dim: 32
     include_cash_token: true
     cash_return: 0.0
     cash_token: "CASH"
-  cache:
-    enable: true
-    root: runs/daily_batch_cache
-    compress: true
-    feature_dtype: float16
-    reuse_existing: true
-    force_refresh: false
+    cache:
+      enable: true
+      root: runs/daily_batch_cache
+      compress: true
+      feature_dtype: float32
+      reuse_existing: true
+      force_refresh: false
 
 model:
-  d_model: 256
+  d_model: 128
   nhead: 4
   num_layers: 2
   dropout: 0.1
@@ -65,18 +65,21 @@ training:
   seed: 42
   device: auto
   epochs: 40
-  batch_size: 4
+  batch_size: 8
   learning_rate: 0.0005
   weight_decay: 0.01
   entropy_coef: 0.01
-  rank_coef: 0.0
+  rank_coef: 1.0
+  group_size: 8
+  clip_ratio: 0.2
+  kl_coef: 0.05
   grad_clip: 1.0
   early_stop_patience: 20
-  pretrain_epochs: 5
+  pretrain_epochs: 10
   checkpoint_root: runs/transformer_grpo
   log_interval: 50
   use_cosine_lr: true
-  temperature: 0.5
+  temperature: 1.0
   train_top_k: 10
 
   logger:

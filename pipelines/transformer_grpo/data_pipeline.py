@@ -491,6 +491,7 @@ class DailyBatchFactory:
         if frame.empty:
             return [], []
 
+        # 1. Prepare Features and Labels
         feature_view = _select_group(frame, feature_group).copy()
         feature_view = _flatten_columns(feature_view)
         label_view = _select_group(frame, label_group)
@@ -504,144 +505,217 @@ class DailyBatchFactory:
             label_series = label_view
         label_series = label_series.copy()
 
+        # Augment features (rolling std, past returns, etc.)
         feature_view = self._augment_feature_view(feature_view, label_series)
-        grouped = feature_view.groupby(level="datetime", sort=True)
+        
+        # Ensure sorting by instrument then datetime for correct rolling
+        # (Assuming index levels are named 'instrument' and 'datetime' or similar)
+        # Qlib default is (datetime, instrument). We need (instrument, datetime) for rolling.
+        if isinstance(feature_view.index, pd.MultiIndex):
+            feature_view = feature_view.swaplevel().sort_index()
+            # Align label series to the same order
+            # Critical Fix: Swap levels of label_series to match (instrument, datetime) structure
+            label_series = label_series.swaplevel().sort_index()
+            # Reindex to ensure exact alignment (though should be aligned by sort)
+            label_series = label_series.reindex(feature_view.index)
+        
+        # 2. Vectorized Rolling Window Generation
+        # Convert to numpy [N_total, F]
+        data_values = feature_view.to_numpy(dtype=self.feature_dtype)
+        
+        # We need to handle the boundaries between instruments.
+        # A simple way is to groupby instrument and apply rolling, but that's slowish in pandas.
+        # Faster: Calculate valid masks based on index.
+        
+        instruments = feature_view.index.get_level_values("instrument").to_numpy()
+        dates = feature_view.index.get_level_values("datetime").to_numpy()
+        
+        # Create 3D tensor [N_total - (T-1), T, F] using stride tricks
+        # This creates a view, so it's memory efficient until we realize it.
+        # However, we must filter out windows that cross instrument boundaries.
+        
+        from numpy.lib.stride_tricks import sliding_window_view
+        
+        T = self.temporal_span
+        if T > 1:
+            # sliding_window_view axis=0 creates [N-T+1, F, T]. We usually want [N-T+1, T, F].
+            # Shape: (N_rows - T + 1, Features, Window_Size) -> transpose to (N, W, F)
+            windows = sliding_window_view(data_values, window_shape=T, axis=0)
+            windows = windows.transpose(0, 2, 1)  # [N', T, F]
+            
+            # Check validity: The instrument at start of window must match instrument at end.
+            # We can just check the instrument array.
+            inst_windows = sliding_window_view(instruments, window_shape=T, axis=0)
+            # Valid if inst[0] == inst[-1] (since it's sorted by inst, datetime)
+            valid_mask = (inst_windows[:, 0] == inst_windows[:, -1])
+            
+            # Filter
+            final_features = windows[valid_mask]
+            final_instruments = instruments[T-1:][valid_mask]
+            final_dates = dates[T-1:][valid_mask]
+            final_labels = label_series.to_numpy()[T-1:][valid_mask]
+        else:
+            final_features = data_values[:, np.newaxis, :]
+            final_instruments = instruments
+            final_dates = dates
+            final_labels = label_series.to_numpy()
+
+        # 3. Group by Date to create DailyBatches
+        # Now we have aligned arrays: features, instruments, dates, labels.
+        # We need to group them by date.
+        
+        # Construct a DataFrame for easy grouping (or use lexicographical sort on dates)
+        # Since we sorted by (inst, date), dates are mixed. We must sort by date.
+        
+        sort_idx = np.argsort(final_dates)
+        final_features = final_features[sort_idx]
+        final_instruments = final_instruments[sort_idx]
+        final_dates = final_dates[sort_idx]
+        final_labels = final_labels[sort_idx]
+        
+        # Identify split points for dates
+        # unique_dates, indices = np.unique(final_dates, return_index=True) 
+        # np.unique is sorted.
+        
+        unique_dates, start_indices = np.unique(final_dates, return_index=True)
+        # start_indices gives the index where each new date starts.
+        
         batches: List[DailyBatch] = []
         calendar: List[pd.Timestamp] = []
-        feature_dim = len(feature_view.columns)
-        buffer_map: Dict[str, deque[np.ndarray]] = defaultdict(lambda: deque(maxlen=self.temporal_span))
+        
         pending_cache_writes: List[_PendingCacheWrite] = []
         cache_executor: Optional[ProcessPoolExecutor] = None
         cache_dir_path: Optional[Path] = None
         if self.cache_enabled and self.cache_dir is not None:
             cache_dir_path = self._cache_dir_for(segment_name)
 
+        feature_dim = final_features.shape[-1]
+
         try:
-            for date, feature_slice in grouped:
-                current_date = pd.Timestamp(date)
-                label_slice = label_series.xs(date, level="datetime")
-                slice_view = feature_slice.droplevel("datetime") if isinstance(feature_slice.index, pd.MultiIndex) else feature_slice
-
-                # 向量化优化：一次性处理所有 instruments
-                # 获取所有 instrument 的索引
-                inst_index = slice_view.index
-                n_inst = len(inst_index)
-
-                if n_inst == 0:
-                    continue
-
-                # 将整个 slice 转为 numpy 数组（避免逐行 iterrows）
-                slice_values = slice_view.to_numpy(dtype=np.float32)  # [n_inst, feature_dim]
-
-                # 批量更新 buffer 并收集结果
-                inst_names: List[str] = []
-                inst_features: List[np.ndarray] = []
-                inst_rewards: List[float] = []
-
-                for idx, inst in enumerate(inst_index):
-                    inst_key = str(inst)
-                    buf = buffer_map[inst_key]
-                    buf.append(slice_values[idx])  # 直接使用预提取的 numpy 数组
-                    if len(buf) < self.temporal_span:
-                        continue
-                    reward_val = label_slice.get(inst, np.nan)
-                    if pd.isna(reward_val):
-                        continue
-                    inst_names.append(inst_key)
-                    inst_features.append(np.stack(buf, axis=0))
-                    inst_rewards.append(float(reward_val))
-
-                if not inst_names:
-                    continue
-
-                instruments = np.array(inst_names, dtype=object)
-                features = np.stack(inst_features).astype(self.feature_dtype, copy=False)
-                rewards = np.array(inst_rewards, dtype=np.float32)
-
+            # Iterate over date chunks
+            for i, date_val in enumerate(unique_dates):
+                start = start_indices[i]
+                end = start_indices[i+1] if i + 1 < len(start_indices) else len(final_dates)
+                
+                current_date = pd.Timestamp(date_val)
+                
+                batch_insts = final_instruments[start:end]
+                batch_feats = final_features[start:end] # [N, T, F]
+                batch_rewards = final_labels[start:end]
+                
+                # Filtering logic (min instruments, universe, etc.)
+                # 1. Universe filter
                 if self.instrument_universe is not None:
-                    mask = np.isin(instruments, list(self.instrument_universe))
+                    mask = np.isin(batch_insts, list(self.instrument_universe))
                     if not mask.any():
                         continue
-                    instruments = instruments[mask]
-                    features = features[mask]
-                    rewards = rewards[mask]
+                    batch_insts = batch_insts[mask]
+                    batch_feats = batch_feats[mask]
+                    batch_rewards = batch_rewards[mask]
 
-                if len(instruments) < self.min_instruments:
+                # 2. Min instruments
+                if len(batch_insts) < self.min_instruments:
                     continue
 
-                if self.max_instruments and len(instruments) > self.max_instruments:
-                    features = features[: self.max_instruments]
-                    rewards = rewards[: self.max_instruments]
-                    instruments = instruments[: self.max_instruments]
-
+                # 3. Reward Clipping/Scaling (Vectorized)
                 if self.reward_clip is not None:
                     low, high = self.reward_clip
-                    rewards = np.clip(rewards, low, high)
+                    batch_rewards = np.clip(batch_rewards, low, high)
                 if self.reward_scale != 1.0:
-                    rewards = rewards * self.reward_scale
+                    batch_rewards = batch_rewards * self.reward_scale
+                
+                # 4. Max instruments (Random sample or Top? config says max_instruments usually for memory)
+                # If we need to cut, just cut.
+                if self.max_instruments and len(batch_insts) > self.max_instruments:
+                    batch_insts = batch_insts[:self.max_instruments]
+                    batch_feats = batch_feats[:self.max_instruments]
+                    batch_rewards = batch_rewards[:self.max_instruments]
 
+                # 5. Cash Token
                 if self.include_cash_token:
+                    # Shape [1, T, F]
                     cash_feat = np.full(
-                        (self.temporal_span, feature_dim),
+                        (1, self.temporal_span, feature_dim),
                         self.cash_feature_value,
                         dtype=self.feature_dtype,
                     )
-                    features = np.vstack([features, cash_feat[np.newaxis, ...]])
-                    rewards = np.concatenate([rewards, np.array([self.cash_return], dtype=np.float32)])
-                    instruments = np.concatenate([instruments, np.array([self.cash_token_name], dtype=object)])
+                    batch_feats = np.concatenate([batch_feats, cash_feat], axis=0)
+                    batch_rewards = np.append(batch_rewards, np.float32(self.cash_return))
+                    batch_insts = np.append(batch_insts, self.cash_token_name)
 
+                # 6. Embeddings
                 if self.instrument_emb_dim > 0:
-                    embeddings = np.stack(
-                        [self._get_instrument_embedding(str(inst)) for inst in instruments]
-                    ).astype(self.feature_dtype)
+                    # Get embeddings for all instruments in batch
+                    # This part is still looped or list-comp, but N is small (hundreds/thousands)
+                    emb_list = [self._get_instrument_embedding(str(inst)) for inst in batch_insts]
+                    embeddings = np.stack(emb_list).astype(self.feature_dtype) # [N, EmbDim]
+                    # Broadcast to temporal dimension
                     embeddings = np.broadcast_to(
                         embeddings[:, np.newaxis, :],
-                        (len(instruments), self.temporal_span, self.instrument_emb_dim),
+                        (len(batch_insts), self.temporal_span, self.instrument_emb_dim),
                     )
-                    features = np.concatenate([features, embeddings], axis=-1)
+                    batch_feats = np.concatenate([batch_feats, embeddings], axis=-1)
 
-                feature_shape = tuple(features.shape)
+                # Ensure final dtype
+                batch_feats = batch_feats.astype(self.feature_dtype, copy=False)
+                batch_rewards = batch_rewards.astype(np.float32, copy=False)
+                
+                # Safety check: NaNs
+                batch_feats = np.nan_to_num(batch_feats, nan=0.0, posinf=0.0, neginf=0.0)
+                batch_rewards = np.nan_to_num(batch_rewards, nan=0.0, posinf=0.0, neginf=0.0)
+
+                feature_shape = tuple(batch_feats.shape)
+                
+                # Caching Logic
                 cache_path: Optional[Path] = None
                 if cache_dir_path is not None:
                     cache_file = f"{current_date.strftime('%Y%m%d')}.npz"
                     if cache_executor is None:
                         cache_executor = ProcessPoolExecutor(max_workers=self.cache_workers)
+                    
+                    # Copy arrays to ensure they are owned and contiguous before sending to another process
+                    # (Slicing numpy arrays creates views which pickling handles, but contiguous is safer/faster)
+                    features_copy = batch_feats.copy()
+                    rewards_copy = batch_rewards.copy()
+                    
                     future = cache_executor.submit(
                         _write_npz_file,
                         str(cache_dir_path),
                         cache_file,
                         self.cache_compress,
-                        features,
-                        rewards,
+                        features_copy,
+                        rewards_copy,
                     )
                     pending_cache_writes.append(
                         _PendingCacheWrite(
                             future=future,
                             segment_name=segment_name,
                             date=current_date,
-                            instruments=[str(inst) for inst in instruments],
+                            instruments=[str(inst) for inst in batch_insts],
                             feature_shape=feature_shape,
                             cache_file=cache_file,
                         )
                     )
                     cache_path = cache_dir_path / cache_file
-                    features = None
-                    rewards = None
+                    batch_feats = None
+                    batch_rewards = None
 
                 batches.append(
                     DailyBatch(
                         date=current_date,
-                        instruments=instruments,
-                        features=features,
-                        rewards=rewards,
+                        instruments=batch_insts,
+                        features=batch_feats,
+                        rewards=batch_rewards,
                         feature_shape=feature_shape,
                         cache_path=cache_path,
                     )
                 )
                 calendar.append(current_date)
+
         finally:
             if cache_executor is not None:
                 self._finalize_cache_writes(pending_cache_writes, cache_executor)
+        
         return batches, calendar
 
     def _augment_feature_view(self, feature_view: pd.DataFrame, label_series: pd.Series) -> pd.DataFrame:
