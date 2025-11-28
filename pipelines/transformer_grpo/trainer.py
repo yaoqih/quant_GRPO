@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 from datetime import datetime
 from pathlib import Path
@@ -149,6 +150,7 @@ class Trainer:
         return torch.device("cpu")
 
     def _build_datasets(self):
+        """构建数据集，顺序处理以减少内存峰值。"""
         handler_cfg = self.data_cfg.get("handler")
         if handler_cfg is None:
             raise ValueError("`data.handler` must be provided in config.")
@@ -168,13 +170,27 @@ class Trainer:
             reward_clip=reward_clip,
             reward_scale=float(self.data_cfg.get("reward", {}).get("scale", 1.0)),
             augment=self.data_cfg.get("augment"),
-            cache_config=self.data_cfg.get("cache"),
+            cache_config=self.data_cfg.get("augment", {}).get("cache"),
             feature_dtype=self.data_cfg.get("feature_dtype", "float32"),
         )
 
+        # 顺序构建数据集，每个构建完后清理内存
+        print("[Data] Building train dataset...")
         self.train_dataset = self.data_factory.build_segment("train")
+        gc.collect()
+
+        print("[Data] Building valid dataset...")
         self.valid_dataset = self.data_factory.build_segment("valid") if "valid" in segments else DailyBatchDataset([])
+        gc.collect()
+
+        print("[Data] Building test dataset...")
         self.test_dataset = self.data_factory.build_segment("test") if "test" in segments else DailyBatchDataset([])
+        gc.collect()
+
+        # 释放 handler 内部缓存
+        if hasattr(self.data_factory, 'handler') and hasattr(self.data_factory.handler, '_data'):
+            self.data_factory.handler._data = None
+        gc.collect()
 
         if len(self.train_dataset) == 0:
             raise ValueError("Training segment produced zero samples.")
@@ -269,7 +285,7 @@ class Trainer:
         try:
             for epoch in range(1, self.epochs + 1):
                 train_stats = self._run_epoch(train_loader, epoch)
-                self.logger.log_metrics("train", {"epoch": epoch, **train_stats})
+                self.logger.log_metrics("train_epoch", {"epoch": epoch, **train_stats}, step=self.global_step)
 
                 val_stats = {}
                 if len(self.valid_dataset) > 0:
@@ -282,7 +298,7 @@ class Trainer:
                         self.no_improve_epochs = 0
                     else:
                         self.no_improve_epochs += 1
-                    self.logger.log_metrics("valid", {"epoch": epoch, **val_stats})
+                    self.logger.log_metrics("valid_epoch", {"epoch": epoch, **val_stats}, step=self.global_step)
 
                 record = {"epoch": epoch, "train": train_stats, "valid": val_stats}
                 with self.history_file.open("a", encoding="utf-8") as f:
@@ -327,7 +343,8 @@ class Trainer:
         total_rank_corr = 0.0
         total_steps = 0
 
-        for step, batch in enumerate(loader, start=1):
+        pbar = tqdm(loader, desc=f"[Train] Epoch {epoch}")
+        for step, batch in enumerate(pbar, start=1):
             features = batch["features"].to(self.device)
             rewards = batch["rewards"].to(self.device) # [batch, num_inst]
             mask = batch["mask"].to(self.device)
@@ -431,9 +448,31 @@ class Trainer:
             total_rank_corr += rank_correlation.mean().item()
             total_steps += 1
 
-            if step % self.log_interval == 0:
-                print(f"[Train] Epoch {epoch} Step {step} loss={loss.item():.4f} "
-                      f"rank_corr={rank_correlation.mean().item():.4f} return={sample_returns.mean().item():.5f}")
+            # Log step-level metrics to wandb/tensorboard
+            step_metrics = {
+                "loss": loss.item(),
+                "pg_loss": pg_loss.item(),
+                "rank_loss": rank_loss.item(),
+                "entropy": entropy.item(),
+                "kl": kl_div.item(),
+                "avg_return": sample_returns.mean().item(),
+                "rank_corr": rank_correlation.mean().item(),
+                "ratio_mean": ratio.mean().item(),
+                "ratio_std": ratio.std().item(),
+                "advantage_mean": advantages.mean().item(),
+                "advantage_std": advantages.std().item(),
+                "lr": self.optimizer.param_groups[0]["lr"],
+                "epoch": epoch,
+                "epoch_step": step,
+            }
+            self.logger.log_metrics("train_step", step_metrics, step=self.global_step)
+
+            # Update tqdm progress bar
+            pbar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                rank_corr=f"{rank_correlation.mean().item():.4f}",
+                ret=f"{sample_returns.mean().item():.5f}"
+            )
 
         n = max(total_steps, 1)
         return {

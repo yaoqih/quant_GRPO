@@ -85,7 +85,6 @@ class TransformerPolicy(nn.Module):
         num_layers: int = 2,
         dropout: float = 0.1,
         ff_multiplier: int = 4,
-        max_positions: int = 1024,
         temporal_span: int = 1,
         temporal_nhead: int = 4,
         temporal_layers: int = 1,

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
-import multiprocessing
+# multiprocessing import removed - using synchronous cache writes
 import os
 import re
 import shutil
 from collections import defaultdict, deque
-from concurrent.futures import Future, ProcessPoolExecutor, as_completed
+# ProcessPoolExecutor removed for memory optimization
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -21,40 +22,6 @@ from qlib.utils import init_instance_by_config
 
 IndexLike = Union[str, pd.Timestamp]
 
-_CACHE_WORKER_OFFSET = 2
-
-
-def _cpu_worker_count(offset: int = _CACHE_WORKER_OFFSET) -> int:
-    try:
-        total = multiprocessing.cpu_count() or 1
-    except NotImplementedError:  # pragma: no cover - platform specific
-        total = 1
-    return max(1, total - max(offset, 0))
-
-
-def _load_cached_batch_worker(date_str: str, meta_path: str, cache_dir: str) -> Optional[Dict[str, Any]]:
-    meta_file = Path(meta_path)
-    if not meta_file.exists():
-        return None
-    try:
-        with meta_file.open("r", encoding="utf-8") as fin:
-            meta = json.load(fin)
-    except Exception:  # noqa: BLE001 - surface as cache miss
-        return None
-    cache_name = meta.get("cache_file") or f"{date_str}.npz"
-    cache_path = Path(cache_dir) / cache_name
-    if not cache_path.exists():
-        return None
-    instruments = meta.get("instruments", [])
-    shape = meta.get("shape", [])
-    return {
-        "date": date_str,
-        "cache_path": str(cache_path),
-        "instruments": instruments,
-        "shape": shape,
-    }
-
-
 def _write_npz_file(directory: str, filename: str, compress: bool, features: np.ndarray, rewards: np.ndarray) -> str:
     target_dir = Path(directory)
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -67,14 +34,7 @@ def _write_npz_file(directory: str, filename: str, compress: bool, features: np.
     return str(path)
 
 
-@dataclass
-class _PendingCacheWrite:
-    future: Future
-    segment_name: str
-    date: pd.Timestamp
-    instruments: List[str]
-    feature_shape: Tuple[int, ...]
-    cache_file: str
+# _PendingCacheWrite class removed - using synchronous cache writes now
 
 
 @dataclass
@@ -89,14 +49,19 @@ class DailyBatch:
     cache_path: Optional[Path] = None
 
     def materialize(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Return numpy arrays for features/rewards, loading from disk if needed."""
+        """Return numpy arrays for features/rewards, loading from disk if needed.
+
+        Uses memory-mapped loading for better memory efficiency.
+        """
         if self.features is not None and self.rewards is not None:
             return self.features, self.rewards
         if self.cache_path is None:
             raise ValueError("No in-memory arrays or cache path available for DailyBatch.")
-        with np.load(self.cache_path, allow_pickle=False) as data:
-            features = data["features"]
-            rewards = data["rewards"]
+        # 使用 mmap_mode='r' 延迟加载，减少峰值内存
+        with np.load(self.cache_path, allow_pickle=False, mmap_mode='r') as data:
+            # 复制为可写数组（训练需要）
+            features = np.array(data["features"])
+            rewards = np.array(data["rewards"])
         return features, rewards
 
 
@@ -177,14 +142,10 @@ class DailyBatchFactory:
         self.instrument_universe = set(instrument_universe) if instrument_universe is not None else None
         self.augment_cfg = augment or {}
         self.temporal_span = max(int(self.augment_cfg.get("temporal_span", 1)), 1)
-        self.roll_vol_windows = sorted(set(int(x) for x in self.augment_cfg.get("rolling_vol_windows", [])))
-        self.future_return_horizons = sorted(
-            set(int(x) for x in self.augment_cfg.get("future_return_horizons", []))
-        )
+
         self.label_expressions = _extract_label_expressions(handler_config)
         self.label_future_lookahead = _infer_label_future_lookahead(self.label_expressions)
         self.label_safe_shift = max(self.label_future_lookahead + 1, 1)
-        self.instrument_emb_dim = int(self.augment_cfg.get("instrument_embedding_dim", 0))
         self.include_cash_token = bool(self.augment_cfg.get("include_cash_token", False))
         self.cash_return = float(self.augment_cfg.get("cash_return", 0.0))
         self.cash_feature_value = float(self.augment_cfg.get("cash_feature_value", 0.0))
@@ -209,12 +170,8 @@ class DailyBatchFactory:
         if self.cache_enabled:
             self.cache_dir = Path(cache_root or "runs/daily_batch_cache")
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-        worker_override = cache_cfg.get("num_workers")
-        if worker_override is not None:
-            self.cache_workers = max(int(worker_override), 1)
-        else:
-            self.cache_workers = _cpu_worker_count()
         self.cache_compress = bool(cache_cfg.get("compress", True))
+        # cache_workers removed - using synchronous writes now
         self._cache_segment_dirs: Dict[str, Path] = {}
         self.cache_signature = self._build_cache_signature(
             handler_config=handler_config,
@@ -241,24 +198,63 @@ class DailyBatchFactory:
         if self.cache_enabled and self.cache_reuse and not self.cache_force_refresh:
             cached_batches = self._load_cached_batches(segment_name)
             if cached_batches is not None:
+                print(f"[Cache] Loaded {len(cached_batches)} batches from cache for '{segment_name}'")
                 return DailyBatchDataset(cached_batches)
         if self.cache_enabled and self.cache_force_refresh:
             self._clear_cache_segment(segment_name)
-        raw_frame = self.handler.fetch(
-            selector=slice(start, end),
-            col_set=[self.feature_group, self.label_group],
-            data_key=data_key,
-        )
-        batches, calendar = self._frame_to_batches(
-            raw_frame,
-            feature_group=self.feature_group,
-            label_group=self.label_group,
-            label_name=self.label_name,
-            segment_name=segment_name,
-        )
-        if self.cache_enabled and calendar:
-            self._write_segment_manifest(segment_name, calendar)
-        return DailyBatchDataset(batches)
+
+        # 分块读取处理，降低峰值内存
+        all_batches: List[DailyBatch] = []
+        all_calendar: List[pd.Timestamp] = []
+
+        for chunk_frame, chunk_start, chunk_end in self._fetch_chunked(start, end, data_key):
+            print(f"[Chunk] Processing {chunk_start.strftime('%Y-%m-%d')} to {chunk_end.strftime('%Y-%m-%d')}...")
+            batches, calendar = self._frame_to_batches_chunk(
+                chunk_frame,
+                feature_group=self.feature_group,
+                label_group=self.label_group,
+                label_name=self.label_name,
+                segment_name=segment_name,
+                valid_start=start,
+                valid_end=end,
+            )
+            all_batches.extend(batches)
+            all_calendar.extend(calendar)
+            # 立即释放 chunk_frame
+            del chunk_frame
+            gc.collect()
+
+        if self.cache_enabled and all_calendar:
+            self._write_segment_manifest(segment_name, all_calendar)
+        return DailyBatchDataset(all_batches)
+
+    def _fetch_chunked(
+        self,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        data_key: str,
+    ):
+        """按年份分块读取数据，降低峰值内存"""
+        start_year = start.year
+        end_year = end.year
+
+        for year in range(start_year, end_year + 1):
+            # 计算当前年份的有效范围
+            chunk_start = max(start, pd.Timestamp(f"{year}-01-01"))
+            chunk_end = min(end, pd.Timestamp(f"{year}-12-31"))
+
+            # 需要额外读取 temporal_span 天的历史数据用于构建窗口
+            lookback_days = self.temporal_span * 2  # 留余量
+            fetch_start = chunk_start - pd.Timedelta(days=lookback_days)
+
+            print(f"[Chunk] Fetching year {year}: {fetch_start.strftime('%Y-%m-%d')} to {chunk_end.strftime('%Y-%m-%d')}...")
+            chunk_frame = self.handler.fetch(
+                selector=slice(fetch_start, chunk_end),
+                col_set=[self.feature_group, self.label_group],
+                data_key=data_key,
+            )
+
+            yield chunk_frame, chunk_start, chunk_end
 
     def _segment_to_pair(self, segment: Union[str, Sequence[IndexLike]]) -> Tuple[IndexLike, IndexLike]:
         if isinstance(segment, str):
@@ -399,6 +395,7 @@ class DailyBatchFactory:
         return instruments, shape, cache_path
 
     def _load_cached_batches(self, segment_name: str) -> Optional[List[DailyBatch]]:
+        """加载缓存的批次数据（优化版：顺序加载 meta 文件，避免多进程内存开销）。"""
         manifest = self._load_segment_manifest(segment_name)
         if manifest is None:
             return None
@@ -408,39 +405,29 @@ class DailyBatchFactory:
         seg_dir = self._cache_dir_for(segment_name, ensure=False)
         if seg_dir is None or not seg_dir.exists():
             return None
-        tasks: List[Tuple[str, str]] = []
+
+        batches: List[DailyBatch] = []
         for date_str in calendar:
             date = pd.Timestamp(date_str)
             meta_path = seg_dir / f"{date.strftime('%Y%m%d')}.meta.json"
             if not meta_path.exists():
                 return None
-            tasks.append((date_str, str(meta_path)))
-        worker_count = max(1, min(self.cache_workers, len(tasks)))
-        result_map: Dict[str, Dict[str, Any]] = {}
-        cache_dir_str = str(seg_dir)
-        with ProcessPoolExecutor(max_workers=worker_count) as pool:
-            futures = {
-                pool.submit(_load_cached_batch_worker, date_str, meta_path, cache_dir_str): date_str
-                for date_str, meta_path in tasks
-            }
-            for future in as_completed(futures):
-                date_key = futures[future]
-                try:
-                    payload = future.result()
-                except Exception:  # noqa: BLE001
-                    return None
-                if payload is None:
-                    return None
-                result_map[date_key] = payload
-        batches: List[DailyBatch] = []
-        for date_str in calendar:
-            payload = result_map.get(date_str)
-            if payload is None:
+
+            # 直接读取 meta 文件（小文件，无需多进程）
+            try:
+                with meta_path.open("r", encoding="utf-8") as fin:
+                    meta = json.load(fin)
+            except Exception:
                 return None
-            date = pd.Timestamp(payload.get("date", date_str))
-            instruments = np.array(payload.get("instruments", []), dtype=object)
-            shape_arr = tuple(int(x) for x in payload.get("shape", []))
-            cache_path = Path(payload["cache_path"])
+
+            cache_name = meta.get("cache_file") or f"{date.strftime('%Y%m%d')}.npz"
+            cache_path = seg_dir / cache_name
+            if not cache_path.exists():
+                return None
+
+            instruments = np.array(meta.get("instruments", []), dtype=object)
+            shape_arr = tuple(int(x) for x in meta.get("shape", []))
+
             batches.append(
                 DailyBatch(
                     date=date,
@@ -453,46 +440,30 @@ class DailyBatchFactory:
             )
         return batches
 
-    def _finalize_cache_writes(
-        self,
-        pending_writes: List[_PendingCacheWrite],
-        executor: ProcessPoolExecutor,
-    ) -> None:
-        error: Optional[RuntimeError] = None
-        for pending in pending_writes:
-            try:
-                pending.future.result()
-            except Exception as exc:  # noqa: BLE001
-                error = RuntimeError(
-                    f"Failed to write cache for segment '{pending.segment_name}' on {pending.date.strftime('%Y-%m-%d')}"
-                )
-                error.__cause__ = exc
-                break
-            instruments = np.array(pending.instruments, dtype=object)
-            self._write_batch_meta(
-                segment_name=pending.segment_name,
-                date=pending.date,
-                instruments=instruments,
-                feature_shape=pending.feature_shape,
-                cache_file=pending.cache_file,
-            )
-        executor.shutdown(wait=True)
-        if error is not None:
-            raise error
+    # _finalize_cache_writes removed - using synchronous cache writes now
 
-    def _frame_to_batches(
+    def _frame_to_batches_chunk(
         self,
         frame: pd.DataFrame,
         feature_group: str,
         label_group: str,
         label_name: Optional[str],
         segment_name: str,
+        valid_start: pd.Timestamp,
+        valid_end: pd.Timestamp,
     ) -> Tuple[List[DailyBatch], List[pd.Timestamp]]:
+        """
+        分块流式处理：
+        - 预处理为高效的 numpy 索引结构
+        - 逐日期处理，每个日期只在内存中保留当天数据
+        - 处理完立即写入缓存并释放
+        - 仅处理 valid_start 到 valid_end 范围内的日期
+        """
         if frame.empty:
             return [], []
 
-        # 1. Prepare Features and Labels
-        feature_view = _select_group(frame, feature_group).copy()
+        # 1. 准备特征和标签（移除不必要的.copy()以减少内存）
+        feature_view = _select_group(frame, feature_group)
         feature_view = _flatten_columns(feature_view)
         label_view = _select_group(frame, label_group)
 
@@ -503,108 +474,100 @@ class DailyBatchFactory:
                 label_series = label_view.iloc[:, 0]
         else:
             label_series = label_view
-        label_series = label_series.copy()
+        # 不再需要.copy()，后续只读取值
 
-        # Augment features (rolling std, past returns, etc.)
-        feature_view = self._augment_feature_view(feature_view, label_series)
-        
-        # Ensure sorting by instrument then datetime for correct rolling
-        # (Assuming index levels are named 'instrument' and 'datetime' or similar)
-        # Qlib default is (datetime, instrument). We need (instrument, datetime) for rolling.
-        if isinstance(feature_view.index, pd.MultiIndex):
-            feature_view = feature_view.swaplevel().sort_index()
-            # Align label series to the same order
-            # Critical Fix: Swap levels of label_series to match (instrument, datetime) structure
-            label_series = label_series.swaplevel().sort_index()
-            # Reindex to ensure exact alignment (though should be aligned by sort)
-            label_series = label_series.reindex(feature_view.index)
-        
-        # 2. Vectorized Rolling Window Generation
-        # Convert to numpy [N_total, F]
-        data_values = feature_view.to_numpy(dtype=self.feature_dtype)
-        
-        # We need to handle the boundaries between instruments.
-        # A simple way is to groupby instrument and apply rolling, but that's slowish in pandas.
-        # Faster: Calculate valid masks based on index.
-        
-        instruments = feature_view.index.get_level_values("instrument").to_numpy()
-        dates = feature_view.index.get_level_values("datetime").to_numpy()
-        
-        # Create 3D tensor [N_total - (T-1), T, F] using stride tricks
-        # This creates a view, so it's memory efficient until we realize it.
-        # However, we must filter out windows that cross instrument boundaries.
-        
-        from numpy.lib.stride_tricks import sliding_window_view
-        
         T = self.temporal_span
-        if T > 1:
-            # sliding_window_view axis=0 creates [N-T+1, F, T]. We usually want [N-T+1, T, F].
-            # Shape: (N_rows - T + 1, Features, Window_Size) -> transpose to (N, W, F)
-            windows = sliding_window_view(data_values, window_shape=T, axis=0)
-            windows = windows.transpose(0, 2, 1)  # [N', T, F]
-            
-            # Check validity: The instrument at start of window must match instrument at end.
-            # We can just check the instrument array.
-            inst_windows = sliding_window_view(instruments, window_shape=T, axis=0)
-            # Valid if inst[0] == inst[-1] (since it's sorted by inst, datetime)
-            valid_mask = (inst_windows[:, 0] == inst_windows[:, -1])
-            
-            # Filter
-            final_features = windows[valid_mask]
-            final_instruments = instruments[T-1:][valid_mask]
-            final_dates = dates[T-1:][valid_mask]
-            final_labels = label_series.to_numpy()[T-1:][valid_mask]
-        else:
-            final_features = data_values[:, np.newaxis, :]
-            final_instruments = instruments
-            final_dates = dates
-            final_labels = label_series.to_numpy()
+        feature_dim = feature_view.shape[1]
 
-        # 3. Group by Date to create DailyBatches
-        # Now we have aligned arrays: features, instruments, dates, labels.
-        # We need to group them by date.
-        
-        # Construct a DataFrame for easy grouping (or use lexicographical sort on dates)
-        # Since we sorted by (inst, date), dates are mixed. We must sort by date.
-        
-        sort_idx = np.argsort(final_dates)
-        final_features = final_features[sort_idx]
-        final_instruments = final_instruments[sort_idx]
-        final_dates = final_dates[sort_idx]
-        final_labels = final_labels[sort_idx]
-        
-        # Identify split points for dates
-        # unique_dates, indices = np.unique(final_dates, return_index=True) 
-        # np.unique is sorted.
-        
-        unique_dates, start_indices = np.unique(final_dates, return_index=True)
-        # start_indices gives the index where each new date starts.
-        
+        # 2. 按股票分组，构建高效索引（关键：避免后续的 pandas 操作）
+        print("[Cache] Building instrument index...")
+        datetime_level = frame.index.get_level_values("datetime")
+        instrument_level = frame.index.get_level_values("instrument")
+        unique_dates = sorted(datetime_level.unique())
+        unique_instruments = list(set(instrument_level))
+
+        # 每只股票：{inst: (features_array, labels_array, sorted_dates_list)}
+        inst_data: Dict[str, Tuple[np.ndarray, np.ndarray, List]] = {}
+
+        for inst in unique_instruments:
+            mask = instrument_level == inst
+            inst_df = feature_view.loc[mask]
+            inst_labels = label_series.loc[mask]
+
+            inst_dates = inst_df.index.get_level_values("datetime")
+            sort_order = np.argsort(inst_dates)
+
+            inst_data[inst] = (
+                inst_df.values[sort_order].astype(self.feature_dtype),
+                inst_labels.values[sort_order].astype(np.float32),
+                [inst_dates[i] for i in sort_order],
+            )
+
+        # 释放原始 DataFrame
+        del feature_view, label_series, label_view, frame
+        gc.collect()
+
+        # 3. 构建日期 -> 股票索引映射
+        # date_inst_idx[date][inst] = idx_in_inst_array
+        print("[Cache] Building date-instrument mapping...")
+        date_inst_idx: Dict[Any, Dict[str, int]] = {d: {} for d in unique_dates}
+        for inst, (_, _, dates_list) in inst_data.items():
+            for idx, dt in enumerate(dates_list):
+                if dt in date_inst_idx:
+                    date_inst_idx[dt][inst] = idx
+
+        # 4. 流式处理每个日期
+        print(f"[Cache] Processing {len(unique_dates)} dates (streaming)...")
         batches: List[DailyBatch] = []
         calendar: List[pd.Timestamp] = []
-        
-        pending_cache_writes: List[_PendingCacheWrite] = []
-        cache_executor: Optional[ProcessPoolExecutor] = None
         cache_dir_path: Optional[Path] = None
+
         if self.cache_enabled and self.cache_dir is not None:
             cache_dir_path = self._cache_dir_for(segment_name)
 
-        feature_dim = final_features.shape[-1]
-
         try:
-            # Iterate over date chunks
-            for i, date_val in enumerate(unique_dates):
-                start = start_indices[i]
-                end = start_indices[i+1] if i + 1 < len(start_indices) else len(final_dates)
-                
-                current_date = pd.Timestamp(date_val)
-                
-                batch_insts = final_instruments[start:end]
-                batch_feats = final_features[start:end] # [N, T, F]
-                batch_rewards = final_labels[start:end]
-                
-                # Filtering logic (min instruments, universe, etc.)
-                # 1. Universe filter
+            for target_date in unique_dates:
+                current_date = pd.Timestamp(target_date)
+
+                # 只处理有效范围内的日期（分块读取会包含额外的历史数据）
+                if current_date < valid_start or current_date > valid_end:
+                    continue
+
+                inst_idx_map = date_inst_idx[target_date]
+
+                batch_insts = []
+                batch_feats_list = []
+                batch_rewards_list = []
+
+                for inst, idx in inst_idx_map.items():
+                    # 检查是否有足够历史数据
+                    if idx < T - 1:
+                        continue
+
+                    features_arr, labels_arr, _ = inst_data[inst]
+
+                    # 直接切片获取窗口 [T, F]
+                    window = features_arr[idx - T + 1: idx + 1]
+                    if window.shape[0] != T:
+                        continue
+
+                    batch_insts.append(inst)
+                    batch_feats_list.append(window)
+                    batch_rewards_list.append(labels_arr[idx])
+
+                # 检查最小股票数
+                if len(batch_insts) < self.min_instruments:
+                    continue
+
+                # 转换为 numpy
+                batch_insts = np.array(batch_insts, dtype=object)
+                batch_feats = np.stack(batch_feats_list, axis=0)  # [N, T, F]
+                batch_rewards = np.array(batch_rewards_list, dtype=np.float32)
+
+                # 立即释放临时列表
+                del batch_feats_list, batch_rewards_list
+
+                # Universe filter
                 if self.instrument_universe is not None:
                     mask = np.isin(batch_insts, list(self.instrument_universe))
                     if not mask.any():
@@ -613,97 +576,63 @@ class DailyBatchFactory:
                     batch_feats = batch_feats[mask]
                     batch_rewards = batch_rewards[mask]
 
-                # 2. Min instruments
                 if len(batch_insts) < self.min_instruments:
                     continue
 
-                # 3. Reward Clipping/Scaling (Vectorized)
+                # Reward Clipping/Scaling
                 if self.reward_clip is not None:
-                    low, high = self.reward_clip
-                    batch_rewards = np.clip(batch_rewards, low, high)
+                    batch_rewards = np.clip(batch_rewards, self.reward_clip[0], self.reward_clip[1])
                 if self.reward_scale != 1.0:
                     batch_rewards = batch_rewards * self.reward_scale
-                
-                # 4. Max instruments (Random sample or Top? config says max_instruments usually for memory)
-                # If we need to cut, just cut.
+
+                # Max instruments
                 if self.max_instruments and len(batch_insts) > self.max_instruments:
                     batch_insts = batch_insts[:self.max_instruments]
                     batch_feats = batch_feats[:self.max_instruments]
                     batch_rewards = batch_rewards[:self.max_instruments]
 
-                # 5. Cash Token
+                # Cash Token
                 if self.include_cash_token:
-                    # Shape [1, T, F]
-                    cash_feat = np.full(
-                        (1, self.temporal_span, feature_dim),
-                        self.cash_feature_value,
-                        dtype=self.feature_dtype,
-                    )
+                    cash_feat = np.full((1, T, feature_dim), self.cash_feature_value, dtype=self.feature_dtype)
                     batch_feats = np.concatenate([batch_feats, cash_feat], axis=0)
                     batch_rewards = np.append(batch_rewards, np.float32(self.cash_return))
                     batch_insts = np.append(batch_insts, self.cash_token_name)
 
-                # 6. Embeddings
-                if self.instrument_emb_dim > 0:
-                    # Get embeddings for all instruments in batch
-                    # This part is still looped or list-comp, but N is small (hundreds/thousands)
-                    emb_list = [self._get_instrument_embedding(str(inst)) for inst in batch_insts]
-                    embeddings = np.stack(emb_list).astype(self.feature_dtype) # [N, EmbDim]
-                    # Broadcast to temporal dimension
-                    embeddings = np.broadcast_to(
-                        embeddings[:, np.newaxis, :],
-                        (len(batch_insts), self.temporal_span, self.instrument_emb_dim),
-                    )
-                    batch_feats = np.concatenate([batch_feats, embeddings], axis=-1)
-
-                # Ensure final dtype
-                batch_feats = batch_feats.astype(self.feature_dtype, copy=False)
-                batch_rewards = batch_rewards.astype(np.float32, copy=False)
-                
-                # Safety check: NaNs
+                # NaN handling
                 batch_feats = np.nan_to_num(batch_feats, nan=0.0, posinf=0.0, neginf=0.0)
                 batch_rewards = np.nan_to_num(batch_rewards, nan=0.0, posinf=0.0, neginf=0.0)
 
                 feature_shape = tuple(batch_feats.shape)
-                
-                # Caching Logic
+
+                # 写入缓存（同步写入，避免多进程内存开销）
                 cache_path: Optional[Path] = None
                 if cache_dir_path is not None:
                     cache_file = f"{current_date.strftime('%Y%m%d')}.npz"
-                    if cache_executor is None:
-                        cache_executor = ProcessPoolExecutor(max_workers=self.cache_workers)
-                    
-                    # Copy arrays to ensure they are owned and contiguous before sending to another process
-                    # (Slicing numpy arrays creates views which pickling handles, but contiguous is safer/faster)
-                    features_copy = batch_feats.copy()
-                    rewards_copy = batch_rewards.copy()
-                    
-                    future = cache_executor.submit(
-                        _write_npz_file,
+                    # 同步写入缓存文件
+                    _write_npz_file(
                         str(cache_dir_path),
                         cache_file,
                         self.cache_compress,
-                        features_copy,
-                        rewards_copy,
+                        batch_feats,
+                        batch_rewards,
                     )
-                    pending_cache_writes.append(
-                        _PendingCacheWrite(
-                            future=future,
-                            segment_name=segment_name,
-                            date=current_date,
-                            instruments=[str(inst) for inst in batch_insts],
-                            feature_shape=feature_shape,
-                            cache_file=cache_file,
-                        )
+                    # 立即写入元数据
+                    self._write_batch_meta(
+                        segment_name=segment_name,
+                        date=current_date,
+                        instruments=batch_insts,
+                        feature_shape=feature_shape,
+                        cache_file=cache_file,
                     )
                     cache_path = cache_dir_path / cache_file
+                    # 释放内存，后续从缓存加载
                     batch_feats = None
                     batch_rewards = None
 
                 batches.append(
                     DailyBatch(
                         date=current_date,
-                        instruments=batch_insts,
+                        instruments=np.array(batch_insts, dtype=object) if batch_insts is not None else np.array([], dtype=object),
                         features=batch_feats,
                         rewards=batch_rewards,
                         feature_shape=feature_shape,
@@ -713,33 +642,12 @@ class DailyBatchFactory:
                 calendar.append(current_date)
 
         finally:
-            if cache_executor is not None:
-                self._finalize_cache_writes(pending_cache_writes, cache_executor)
-        
-        return batches, calendar
+            # 释放所有数据
+            del inst_data, date_inst_idx
+            gc.collect()
 
-    def _augment_feature_view(self, feature_view: pd.DataFrame, label_series: pd.Series) -> pd.DataFrame:
-        frames = [feature_view]
-        safe_label_series = None
-        if self.roll_vol_windows or self.future_return_horizons:
-            # Shift label-derived data far enough into the past so no future price information leaks into features.
-            safe_label_series = label_series.groupby(level="instrument").shift(self.label_safe_shift)
-        if self.roll_vol_windows:
-            grouped_label = safe_label_series.groupby(level="instrument")
-            for window in self.roll_vol_windows:
-                rolled = grouped_label.rolling(window, min_periods=1).std().droplevel(0)
-                shifted = rolled.groupby(level="instrument").shift(1)
-                frames.append(shifted.reindex(feature_view.index).to_frame(name=f"label_std_{window}"))
-        if self.future_return_horizons:
-            grouped_label = safe_label_series.groupby(level="instrument")
-            for horizon in self.future_return_horizons:
-                # Rolling product over past horizon days (include current), then shift forward so each row only sees past info.
-                prod = (1.0 + grouped_label).rolling(horizon, min_periods=horizon).apply(np.prod, raw=True).droplevel(0) - 1.0
-                past_future = prod.groupby(level="instrument").shift(1)
-                frames.append(past_future.reindex(feature_view.index).to_frame(name=f"past_return_{horizon}"))
-        augmented = pd.concat(frames, axis=1)
-        augmented = augmented.fillna(0.0)
-        return augmented
+        print(f"[Cache] Built {len(batches)} batches for '{segment_name}'")
+        return batches, calendar
 
     def _build_cache_signature(
         self,
@@ -772,16 +680,6 @@ class DailyBatchFactory:
         }
         dump = json.dumps(payload, sort_keys=True, default=str)
         return hashlib.sha256(dump.encode("utf-8")).hexdigest()
-
-    def _get_instrument_embedding(self, instrument: str) -> np.ndarray:
-        if self.instrument_emb_dim <= 0:
-            return np.zeros((1,), dtype=np.float32)
-        if instrument not in self._instrument_embed_cache:
-            seed = (hash(instrument) & 0xFFFF_FFFF) or 7
-            rng = np.random.default_rng(seed)
-            self._instrument_embed_cache[instrument] = rng.standard_normal(self.instrument_emb_dim).astype(np.float32)
-        return self._instrument_embed_cache[instrument]
-
 
 def _select_group(frame: pd.DataFrame, group: str) -> Union[pd.DataFrame, pd.Series]:
     cols = frame.columns
@@ -844,9 +742,10 @@ def _infer_label_future_lookahead(label_expressions: Sequence[str]) -> int:
 
 
 def _flatten_columns(frame: pd.DataFrame) -> pd.DataFrame:
-    flat = frame.copy()
-    if isinstance(flat.columns, pd.MultiIndex):
-        flat.columns = ["__".join(str(part) for part in col if part is not None) for col in flat.columns.values]
+    """扁平化列名（不复制数据，直接返回重命名后的视图）"""
+    if isinstance(frame.columns, pd.MultiIndex):
+        new_cols = ["__".join(str(part) for part in col if part is not None) for col in frame.columns.values]
     else:
-        flat.columns = [str(col) for col in flat.columns]
-    return flat
+        new_cols = [str(col) for col in frame.columns]
+    # 使用 set_axis 避免复制数据
+    return frame.set_axis(new_cols, axis=1, copy=False)
