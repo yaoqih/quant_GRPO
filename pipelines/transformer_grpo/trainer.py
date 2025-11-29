@@ -21,7 +21,14 @@ from .backtest import run_backtest, save_trades
 from .data_pipeline import DailyBatchDataset, DailyBatchFactory
 from .logger import LoggerFactory
 from .model import TransformerPolicy
-from .utils import collate_daily_batches, compute_topk_weights, ensure_dir, set_global_seed, sample_topk_actions
+from .utils import (
+    PrefetchDataLoader,
+    collate_daily_batches,
+    compute_topk_weights,
+    ensure_dir,
+    set_global_seed,
+    sample_topk_actions,
+)
 
 
 def compute_rank_correlation(pred_scores: torch.Tensor, actual_rewards: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -112,6 +119,8 @@ class Trainer:
         self.device = self._resolve_device(self.train_cfg.get("device", "auto"))
 
         self._build_datasets()
+        self._loader_prefetches_device = False
+        self._loader_pin_memory = False
 
         # 训练参数
         self.epochs = int(self.train_cfg.get("epochs", 40))
@@ -217,9 +226,51 @@ class Trainer:
             yaml.safe_dump(self.config, f, allow_unicode=True)
 
     def _build_loader(self, dataset: DailyBatchDataset, shuffle: bool) -> DataLoader:
-        return DataLoader(
-            dataset, batch_size=self.batch_size, shuffle=shuffle,
-            collate_fn=collate_daily_batches, num_workers=0, drop_last=False,
+        loader_cfg = self.train_cfg.get("dataloader", {})
+        num_workers = int(loader_cfg.get("num_workers", 0))
+        pin_memory_default = self.device.type == "cuda"
+        pin_memory = bool(loader_cfg.get("pin_memory", pin_memory_default))
+        loader_kwargs = {
+            "dataset": dataset,
+            "batch_size": self.batch_size,
+            "shuffle": shuffle,
+            "collate_fn": collate_daily_batches,
+            "num_workers": num_workers,
+            "drop_last": False,
+            "pin_memory": pin_memory,
+        }
+        if num_workers > 0:
+            prefetch_factor = loader_cfg.get("prefetch_factor")
+            if prefetch_factor is not None:
+                loader_kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
+            loader_kwargs["persistent_workers"] = bool(loader_cfg.get("persistent_workers", False))
+        loader = DataLoader(**loader_kwargs)
+
+        async_transfer = bool(loader_cfg.get("async_device_transfer", False)) and self.device.type == "cuda"
+        buffer_size = int(loader_cfg.get("prefetch_batches", 0))
+        if async_transfer:
+            buffer_size = max(buffer_size, 2)
+        should_wrap = async_transfer or buffer_size > 0
+        if should_wrap:
+            loader = PrefetchDataLoader(
+                loader=loader,
+                buffer_size=max(buffer_size, 1),
+                device=self.device if async_transfer else None,
+                async_transfer=async_transfer,
+            )
+
+        self._loader_pin_memory = pin_memory
+        self._loader_prefetches_device = async_transfer
+        return loader
+
+    def _move_batch_to_device(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._loader_prefetches_device:
+            return batch["features"], batch["rewards"], batch["mask"]
+        non_blocking = self.device.type == "cuda" and self._loader_pin_memory
+        return (
+            batch["features"].to(self.device, non_blocking=non_blocking),
+            batch["rewards"].to(self.device, non_blocking=non_blocking),
+            batch["mask"].to(self.device, non_blocking=non_blocking),
         )
 
     def _pretrain_policy(self):
@@ -236,9 +287,7 @@ class Trainer:
             steps = 0
 
             for batch in tqdm(loader, desc=f"[Pretrain] Epoch {epoch}"):
-                features = batch["features"].to(self.device)
-                rewards = batch["rewards"].to(self.device)
-                mask = batch["mask"].to(self.device)
+                features, rewards, mask = self._move_batch_to_device(batch)
 
                 logits, _ = self.model(features, mask)
 
@@ -284,7 +333,7 @@ class Trainer:
         try:
             for epoch in range(1, self.epochs + 1):
                 train_stats = self._run_epoch(train_loader, epoch)
-                self.logger.log_metrics("train_epoch", {"epoch": epoch, **train_stats}, step=self.global_step)
+                self.logger.log_metrics("train_epoch", {"epoch": epoch, **train_stats})
 
                 val_stats = {}
                 if len(self.valid_dataset) > 0:
@@ -297,7 +346,7 @@ class Trainer:
                         self.no_improve_epochs = 0
                     else:
                         self.no_improve_epochs += 1
-                    self.logger.log_metrics("valid_epoch", {"epoch": epoch, **val_stats}, step=self.global_step)
+                    self.logger.log_metrics("valid_epoch", {"epoch": epoch, **val_stats})
 
                 record = {"epoch": epoch, "train": train_stats, "valid": val_stats}
                 with self.history_file.open("a", encoding="utf-8") as f:
@@ -344,9 +393,7 @@ class Trainer:
 
         pbar = tqdm(loader, desc=f"[Train] Epoch {epoch}")
         for step, batch in enumerate(pbar, start=1):
-            features = batch["features"].to(self.device)
-            rewards = batch["rewards"].to(self.device) # [batch, num_inst]
-            mask = batch["mask"].to(self.device)
+            features, rewards, mask = self._move_batch_to_device(batch)
 
             # 1. Policy Forward
             logits, _ = self.model(features, mask)
@@ -374,6 +421,8 @@ class Trainer:
             selected_rewards = (rewards_expanded * sampled_masks.float()).sum(dim=-1)
             selected_counts = sampled_masks.sum(dim=-1).clamp(min=1.0)
             sample_returns = selected_rewards / selected_counts # [batch, group]
+            avg_batch_return = sample_returns.mean()
+            avg_return_value = avg_batch_return.item()
 
             # 4. Compute Advantages (Group Relative)
             # Mean and Std across the group dimension
@@ -412,7 +461,7 @@ class Trainer:
             kl_div = (old_log_probs - new_log_probs).mean()
             
             # Entropy
-            probs = F.softmax(masked_logits / self.temperature, dim=-1)
+            probs = all_log_probs.exp()
             entropy = -(probs * all_log_probs).sum(dim=-1).mean()
             
             # ListMLE (Ranking)
@@ -443,7 +492,7 @@ class Trainer:
             total_rank_loss += rank_loss.item()
             total_entropy += entropy.item()
             total_kl += kl_div.item()
-            total_return += sample_returns.mean().item()
+            total_return += avg_return_value
             total_rank_corr += rank_correlation.mean().item()
             total_steps += 1
 
@@ -454,7 +503,7 @@ class Trainer:
                 "rank_loss": rank_loss.item(),
                 "entropy": entropy.item(),
                 "kl": kl_div.item(),
-                "avg_return": sample_returns.mean().item(),
+                "avg_return": avg_return_value,
                 "rank_corr": rank_correlation.mean().item(),
                 "ratio_mean": ratio.mean().item(),
                 "ratio_std": ratio.std().item(),
@@ -470,7 +519,7 @@ class Trainer:
             pbar.set_postfix(
                 loss=f"{loss.item():.4f}",
                 rank_corr=f"{rank_correlation.mean().item():.4f}",
-                ret=f"{sample_returns.mean().item():.5f}"
+                ret=f"{avg_return_value:.5f}"
             )
 
         n = max(total_steps, 1)

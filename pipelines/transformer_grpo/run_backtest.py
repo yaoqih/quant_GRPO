@@ -58,7 +58,6 @@ def main() -> None:
         reward_clip=reward_clip,
         reward_scale=float(cfg["data"].get("reward", {}).get("scale", 1.0)),
         augment=cfg["data"].get("augment"),
-        cache_config=cfg["data"].get("augment", {}).get("cache"),
         feature_dtype=cfg["data"].get("feature_dtype", "float32"),
     )
 

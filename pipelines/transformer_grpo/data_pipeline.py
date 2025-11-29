@@ -38,6 +38,7 @@ class DailyBatch:
     rewards: Optional[np.ndarray]
     feature_shape: Tuple[int, ...] = field(default_factory=tuple)
     window_dates: Sequence[pd.Timestamp] = field(default_factory=list)
+    index_slices: Optional[Sequence[np.ndarray]] = None
     data_instruments: Optional[np.ndarray] = None
     loader: Optional["RollingWindowLoader"] = None
     temporal_span: int = 1
@@ -112,23 +113,29 @@ class RollingWindowLoader:
         if not batch.window_dates:
             raise ValueError("DailyBatch missing window_dates information.")
 
-        instruments = batch.data_instruments if batch.data_instruments is not None else batch.instruments
-        instruments = np.array(instruments, dtype=object)
+        base_instruments = batch.data_instruments if batch.data_instruments is not None else batch.instruments
+        base_instruments = np.array(base_instruments, dtype=object)
 
         feature_slices: List[np.ndarray] = []
-        for date in batch.window_dates:
+        for idx, date in enumerate(batch.window_dates):
             entry = self.cross_sections.get(pd.Timestamp(date))
             if entry is None:
                 raise KeyError(f"Missing cross-section for {date}.")
-            idx = self._indices_for(entry, instruments)
-            feature_slices.append(np.array(entry.features[idx], dtype=self.feature_dtype, copy=False))
+            if batch.index_slices is not None and idx < len(batch.index_slices):
+                take_idx = np.asarray(batch.index_slices[idx], dtype=np.int64)
+            else:
+                take_idx = self._indices_for(entry, base_instruments)
+            feature_slices.append(np.asarray(entry.features[take_idx], dtype=self.feature_dtype, copy=False))
 
         stacked = np.stack(feature_slices, axis=1)  # [num_inst, T, feature_dim]
         stacked = np.nan_to_num(stacked, nan=0.0, posinf=0.0, neginf=0.0)
 
         final_entry = self.cross_sections[pd.Timestamp(batch.window_dates[-1])]
-        final_idx = self._indices_for(final_entry, instruments)
-        rewards = np.array(final_entry.rewards[final_idx], dtype=np.float32, copy=False)
+        if batch.index_slices is not None and len(batch.index_slices) >= len(batch.window_dates):
+            final_idx = np.asarray(batch.index_slices[-1], dtype=np.int64)
+        else:
+            final_idx = self._indices_for(final_entry, base_instruments)
+        rewards = np.asarray(final_entry.rewards[final_idx], dtype=np.float32, copy=False)
         rewards = np.nan_to_num(rewards, nan=0.0, posinf=0.0, neginf=0.0)
 
         if batch.include_cash_token:
@@ -241,9 +248,8 @@ class DailyBatchFactory:
             else:
                 label_series = label_view
 
-            datetime_level = frame.index.get_level_values("datetime")
-            instrument_level = frame.index.get_level_values("instrument")
-            unique_dates = sorted(datetime_level.unique())
+            unique_dates = feature_view.index.get_level_values("datetime").unique()
+            unique_dates = sorted(unique_dates)
 
             for target_date in unique_dates:
                 current_date = pd.Timestamp(target_date)
@@ -255,13 +261,15 @@ class DailyBatchFactory:
                     # Skip duplicate days introduced by chunk lookback windows.
                     continue
 
-                mask = datetime_level == current_date
-                if not mask.any():
+                try:
+                    day_feat_df = feature_view.xs(current_date, level="datetime")
+                    day_reward_series = label_series.xs(current_date, level="datetime")
+                except KeyError:
                     continue
 
-                day_feats = feature_view.loc[mask].values.astype(self.feature_dtype, copy=False)
-                day_rewards = label_series.loc[mask].values.astype(np.float32, copy=False)
-                day_instruments = instrument_level[mask].to_numpy().astype(str)
+                day_feats = day_feat_df.to_numpy(dtype=self.feature_dtype, copy=False)
+                day_rewards = day_reward_series.to_numpy(dtype=np.float32, copy=False)
+                day_instruments = day_feat_df.index.get_level_values("instrument").to_numpy().astype(str)
 
                 if day_feats.size == 0:
                     continue
@@ -371,6 +379,16 @@ class DailyBatchFactory:
         if self.include_cash_token:
             final_instruments = np.append(final_instruments, self.cash_token_name)
 
+        index_slices: List[np.ndarray] = []
+        for entry in metas:
+            index_slices.append(
+                np.fromiter(
+                    (entry.index_map[str(inst)] for inst in data_instruments),
+                    dtype=np.int64,
+                    count=len(data_instruments),
+                )
+            )
+
         feature_shape = (len(final_instruments), self.temporal_span, target_entry.feature_dim)
 
         return DailyBatch(
@@ -380,6 +398,7 @@ class DailyBatchFactory:
             rewards=None,
             feature_shape=feature_shape,
             window_dates=[entry.date for entry in metas],
+            index_slices=index_slices,
             data_instruments=data_instruments,
             loader=loader,
             temporal_span=self.temporal_span,

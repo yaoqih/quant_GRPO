@@ -9,7 +9,7 @@ data:
     class: Alpha360
     module_path: qlib.contrib.data.handler
     kwargs:
-      instruments: csi300
+      instruments: all
       start_time: 2010-01-01
       end_time: 2025-01-01
       fit_start_time: 2010-01-01
@@ -28,7 +28,7 @@ data:
       label:
         - "Ref($open, -2) / Ref($open, -1) - 1"
   segments:
-    train: ["2010-01-01", "2022-12-31"]
+    train: ["2010-01-01", "2010-12-31"]
     valid: ["2023-01-01", "2023-12-31"]
     test: ["2024-01-01", "2024-12-31"]
   feature_group: feature
@@ -81,6 +81,14 @@ training:
   use_cosine_lr: true
   temperature: 1.0
   train_top_k: 100
+
+  dataloader:
+    num_workers: 12
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 8
+    prefetch_batches: 16
+    async_device_transfer: true
 
   logger:
     type: wandb

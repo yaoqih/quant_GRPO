@@ -1,10 +1,12 @@
 """Utility functions for transformer GRPO pipeline."""
 from __future__ import annotations
 
-import random
-from pathlib import Path
-from typing import Dict, List, Tuple
 import math
+import random
+import threading
+from queue import Queue
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -25,6 +27,93 @@ def set_global_seed(seed: int) -> None:
 def ensure_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+class BackgroundGenerator:
+    """
+    Prefetch samples on a background thread to overlap CPU batch preparation with GPU work.
+    Inspired by the strategy used in YOLO-style dataloaders.
+    """
+
+    def __init__(self, iterator: Iterator, max_prefetch: int = 1):
+        self._iterator = iterator
+        self._queue: "Queue[Any]" = Queue(max(1, max_prefetch))
+        self._sentinel = object()
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def _worker(self) -> None:
+        try:
+            for item in self._iterator:
+                self._queue.put(item)
+        finally:
+            self._queue.put(self._sentinel)
+
+    def __iter__(self) -> "BackgroundGenerator":
+        return self
+
+    def __next__(self) -> Any:
+        item = self._queue.get()
+        if item is self._sentinel:
+            raise StopIteration
+        return item
+
+
+def _move_batch_to_device(data: Any, device: torch.device) -> Any:
+    if torch.is_tensor(data):
+        return data.to(device, non_blocking=True)
+    if isinstance(data, dict):
+        return {key: _move_batch_to_device(value, device) for key, value in data.items()}
+    if isinstance(data, list):
+        return [_move_batch_to_device(value, device) for value in data]
+    if isinstance(data, tuple):
+        return tuple(_move_batch_to_device(value, device) for value in data)
+    return data
+
+
+class PrefetchDataLoader:
+    """
+    Wrapper around DataLoader that (1) prefetches batches on a background thread/process and
+    (2) optionally moves tensors to the target device asynchronously via a dedicated CUDA stream.
+    """
+
+    def __init__(
+        self,
+        loader: torch.utils.data.DataLoader,
+        buffer_size: int = 2,
+        device: Optional[torch.device] = None,
+        async_transfer: bool = False,
+    ):
+        self.loader = loader
+        self.buffer_size = max(int(buffer_size), 1)
+        self.device = device
+        self.async_transfer = async_transfer and device is not None and device.type == "cuda"
+
+    def __iter__(self):
+        iterator = iter(self.loader)
+        if self.buffer_size > 1:
+            iterator = BackgroundGenerator(iterator, max_prefetch=self.buffer_size)
+
+        if not self.async_transfer:
+            yield from iterator
+            return
+
+        stream = torch.cuda.Stream(device=self.device)
+
+        def _next_prefetched():
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                return None
+            with torch.cuda.stream(stream):
+                return _move_batch_to_device(batch, self.device)  # type: ignore[arg-type]
+
+        next_batch = _next_prefetched()
+        while next_batch is not None:
+            torch.cuda.current_stream().wait_stream(stream)
+            current = next_batch
+            next_batch = _next_prefetched()
+            yield current
 
 
 def compute_topk_weights(
@@ -120,45 +209,37 @@ def sample_topk_actions(
     Robust version handling K > valid_count.
     """
     batch_size, num_inst = logits.shape
-    
-    # Flatten for sampling: [batch * group, num_inst]
-    logits_expanded = logits.unsqueeze(1).expand(-1, group_size, -1)
-    mask_expanded = mask.unsqueeze(1).expand(-1, group_size, -1)
-    
-    logits_flat = logits_expanded.reshape(-1, num_inst)
-    mask_flat = mask_expanded.reshape(-1, num_inst)
-    
-    masked_logits = logits_flat.masked_fill(~mask_flat, -1e9)
-    scores = masked_logits / max(temperature, 1e-4)
-    probs = F.softmax(scores, dim=-1)
-    
-    # Handle variable valid counts across batch
-    # Since torch.multinomial requires fixed num_samples, we set K = min(top_k, min_valid_count)
-    # But wait, if one batch has 5 valid and another 100, we shouldn't limit both to 5.
-    # Solution: Loop or just assume data is dense enough (usually > 300 stocks).
-    # Given Qlib constraint "min_instruments=30", we are safe if top_k=10.
-    # But to be safe, we cap K.
-    
-    valid_counts = mask_flat.sum(dim=1)
-    min_valid = valid_counts.min().item()
-    effective_k = min(top_k, int(min_valid))
-    
-    if effective_k < 1:
-        # Should not happen if min_instruments >= 1
-        # Fallback to taking top 1
-        effective_k = 1
+    temperature = max(float(temperature), 1e-4)
+    masked_logits = logits.masked_fill(~mask, -1e9)
 
-    action_indices = torch.multinomial(probs, num_samples=effective_k, replacement=False)
-    
-    sampled_masks_flat = torch.zeros_like(mask_flat, dtype=torch.bool)
-    sampled_masks_flat.scatter_(1, action_indices, True)
-    
-    # Calculate surrogate log probs
-    log_probs_all = F.log_softmax(scores, dim=-1)
-    selected_log_probs = torch.gather(log_probs_all, 1, action_indices)
-    sample_log_probs = selected_log_probs.sum(dim=-1)
-    
-    return sampled_masks_flat.view(batch_size, group_size, num_inst), sample_log_probs.view(batch_size, group_size)
+    sampled_masks = torch.zeros(batch_size, group_size, num_inst, dtype=torch.bool, device=logits.device)
+    sample_log_probs = torch.zeros(batch_size, group_size, device=logits.device)
+
+    for b in range(batch_size):
+        valid_count = int(mask[b].sum().item())
+        if valid_count == 0:
+            continue
+
+        for g in range(group_size):
+            remaining_mask = mask[b].clone()
+            picks = min(top_k, valid_count)
+            log_prob = torch.tensor(0.0, device=logits.device)
+
+            for _ in range(picks):
+                if not bool(remaining_mask.any().item()):
+                    break
+                step_logits = masked_logits[b].masked_fill(~remaining_mask, -1e9)
+                step_scores = step_logits / temperature
+                step_log_probs = F.log_softmax(step_scores, dim=-1)
+                probs = step_log_probs.exp()
+                action = torch.multinomial(probs, num_samples=1).item()
+                sampled_masks[b, g, action] = True
+                log_prob = log_prob + step_log_probs[action]
+                remaining_mask[action] = False
+
+            sample_log_probs[b, g] = log_prob
+
+    return sampled_masks, sample_log_probs
 
 
 
@@ -192,7 +273,12 @@ def collate_daily_batches(samples: List[DailyBatch]) -> Dict[str, object]:
         features[idx, :length] = torch.from_numpy(feat.astype(np.float32, copy=False))
         rewards[idx, :length] = torch.from_numpy(rew.astype(np.float32, copy=False))
         mask[idx, :length] = True
-        metadata.append({"date": sample.date, "instruments": sample.instruments})
+        metadata.append(
+            {
+                "date": sample.date.to_pydatetime() if hasattr(sample.date, "to_pydatetime") else sample.date,
+                "instruments": [str(inst) for inst in sample.instruments.tolist()],
+            }
+        )
 
     return {
         "features": features,
