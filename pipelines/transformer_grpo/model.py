@@ -1,72 +1,54 @@
 """Transformer-based policy network for cross-sectional stock selection."""
 from __future__ import annotations
 
-import math
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 
-class PositionalEncoding(nn.Module):
-    """标准正弦位置编码，仅用于时序编码器。"""
+class GatedFeatureExtractor(nn.Module):
+    """在进入主干网络前抑制冗余特征噪声。"""
 
-    def __init__(self, d_model: int, max_len: int = 1024, dropout: float = 0.0):
+    def __init__(self, feature_dim: int, d_model: int, dropout: float = 0.1):
         super().__init__()
+        self.linear_val = nn.Linear(feature_dim, d_model)
+        self.linear_gate = nn.Linear(feature_dim, d_model)
         self.dropout = nn.Dropout(dropout)
-        self.d_model = d_model
-        pe = self._generate_pe(max_len)
-        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
-
-    def _generate_pe(self, length: int) -> torch.Tensor:
-        position = torch.arange(0, length, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, self.d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / self.d_model)
-        )
-        pe = torch.zeros(length, self.d_model, dtype=torch.float32)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        return pe
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        length = x.size(1)
-        if length > self.pe.size(1):
-            new_pe = self._generate_pe(length).unsqueeze(0).to(x.device)
-            self.pe = new_pe
-        pe_slice = self.pe[:, :length]
-        if pe_slice.device != x.device:
-            pe_slice = pe_slice.to(x.device)
-        return self.dropout(x + pe_slice)
+        values = self.linear_val(x)
+        gate = self.sigmoid(self.linear_gate(x))
+        return self.dropout(values * gate)
 
 
-class TemporalEncoder(nn.Module):
-    """时序注意力编码器，使用CLS token聚合。"""
+class GRUTemporalEncoder(nn.Module):
+    """针对短时序的轻量级编码器，天然具备时间先验。"""
 
-    def __init__(self, d_model: int, nhead: int = 4, num_layers: int = 1, dropout: float = 0.1, max_len: int = 64):
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int = 1, dropout: float = 0.1):
         super().__init__()
-        self.d_model = d_model
-        self.temporal_pe = PositionalEncoding(d_model, max_len=max_len, dropout=dropout)
-        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, dim_feedforward=d_model * 4,
-            dropout=dropout, activation="gelu", batch_first=True,
+        self.gru = nn.GRU(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
         )
-        self.attention = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: [batch * instruments, temporal_span, d_model]
+            x: [batch * instruments, temporal_span, input_dim]
         Returns:
-            [batch * instruments, d_model]
+            [batch * instruments, hidden_dim]
         """
-        batch_size = x.size(0)
-        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
-        x = torch.cat([cls_tokens, x], dim=1)
-        x = self.temporal_pe(x)
-        x = self.attention(x)
-        return self.norm(x[:, 0, :])
+        self.gru.flatten_parameters()
+        _, h_n = self.gru(x)
+        last_hidden = h_n[-1]
+        return self.norm(self.dropout(last_hidden))
 
 
 class TransformerPolicy(nn.Module):
@@ -86,7 +68,7 @@ class TransformerPolicy(nn.Module):
         dropout: float = 0.1,
         ff_multiplier: int = 4,
         temporal_span: int = 1,
-        temporal_nhead: int = 4,
+        temporal_nhead: int = 4,  # 兼容旧配置，保持接口不报错
         temporal_layers: int = 1,
         **_kwargs,
     ):
@@ -96,12 +78,14 @@ class TransformerPolicy(nn.Module):
         
         # Feature normalization on the last dimension only (insensitive to padding)
         self.feature_norm = nn.LayerNorm(feature_dim)
-        self.feature_proj = nn.Linear(feature_dim, d_model)
+        self.feature_gating = GatedFeatureExtractor(feature_dim, d_model, dropout=dropout)
 
-        # 时序编码器（有位置编码，因为时间有顺序）
-        self.temporal_encoder = TemporalEncoder(
-            d_model=d_model, nhead=temporal_nhead, num_layers=temporal_layers,
-            dropout=dropout, max_len=max(temporal_span + 1, 64),
+        # 20日以内短序列用GRU更稳定
+        self.temporal_encoder = GRUTemporalEncoder(
+            input_dim=d_model,
+            hidden_dim=d_model,
+            num_layers=temporal_layers,
+            dropout=dropout,
         )
 
         # 截面编码器（无位置编码，因为股票没有固定顺序）
@@ -135,21 +119,36 @@ class TransformerPolicy(nn.Module):
             batch, instruments, timesteps, _ = features.shape
 
             normed_features = self.feature_norm(features)
-            projected = self.feature_proj(normed_features)
-            temporal_input = projected.view(batch * instruments, timesteps, self.d_model)
+            gated = self.feature_gating(normed_features)
+            temporal_input = gated.reshape(batch * instruments, timesteps, self.d_model)
             temporal_out = self.temporal_encoder(temporal_input)
             x = temporal_out.view(batch, instruments, self.d_model)
         else:
+            batch, instruments, _ = features.shape
             normed_features = self.feature_norm(features)
-            x = self.feature_proj(normed_features)
+            x = self.feature_gating(normed_features)
 
         x = self.layer_norm(x)
 
-        # 注意：这里不添加positional encoding！
-        # 股票之间没有顺序关系，PE会引入错误的归纳偏置
+        # 构造市场上下文token，避免噪声股票彼此互扰
+        if mask is not None:
+            mask = mask.to(dtype=torch.bool)
+            mask_float = mask.float()
+            valid_count = mask_float.sum(dim=1, keepdim=True).clamp_min(1.0)
+            market_context = (x * mask_float.unsqueeze(-1)).sum(dim=1, keepdim=True) / valid_count.unsqueeze(-1)
+            padding_mask = torch.cat(
+                [torch.zeros(batch, 1, dtype=torch.bool, device=mask.device), ~mask],
+                dim=1,
+            )
+        else:
+            market_context = x.mean(dim=1, keepdim=True)
+            padding_mask = None
 
-        key_padding_mask = ~mask if mask is not None else None
-        encoded = self.encoder(x, src_key_padding_mask=key_padding_mask)
+        x_with_context = torch.cat([market_context, x], dim=1)
 
-        logits = self.policy_head(encoded).squeeze(-1)
+        key_padding_mask = padding_mask
+        encoded = self.encoder(x_with_context, src_key_padding_mask=key_padding_mask)
+
+        stock_embeddings = encoded[:, 1:, :]
+        logits = self.policy_head(stock_embeddings).squeeze(-1)
         return logits, None

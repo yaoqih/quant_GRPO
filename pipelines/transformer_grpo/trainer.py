@@ -93,7 +93,59 @@ def compute_listmle_loss_vectorized(logits: torch.Tensor, rewards: torch.Tensor,
 
     return batch_loss.mean()
 
+import math
 
+class TopKScheduler:
+    def __init__(self, start_k: int, end_k: int, total_epochs: int, strategy: str = "linear"):
+        """
+        Top-K 调度器
+        
+        Args:
+            start_k: 初始 Top-K (例如 30)
+            end_k: 最终 Top-K (例如 5)
+            total_epochs: 总 Epoch 数
+            strategy: 'linear' (线性) 或 'cosine' (余弦退火)
+        """
+        self.start_k = start_k
+        self.end_k = max(1, end_k) # 保证至少为1
+        self.total_epochs = total_epochs
+        self.strategy = strategy
+
+    def get_k(self, current_epoch: int) -> int:
+        """根据当前 epoch (1-based) 返回当前的 k 值"""
+        # 防止越界
+        if current_epoch >= self.total_epochs:
+            return self.end_k
+        if current_epoch <= 0:
+            return self.start_k
+
+        # 进度 (0.0 -> 1.0)
+        progress = (current_epoch - 1) / (self.total_epochs - 1)
+
+        if self.strategy == "linear":
+            # 线性衰减: k = start - (start - end) * progress
+            k = self.start_k - (self.start_k - self.end_k) * progress
+        
+        elif self.strategy == "cosine":
+            # 余弦衰减: 也就是先慢，中间快，最后慢
+            cosine_progress = 0.5 * (1 + math.cos(progress * math.pi))
+            # 注意：cosine 是从 1 到 -1 (或类似)，这里简化为权重混合
+            # 修正公式：start + (end - start) * (1 - cosine_decay)
+            # 简单写法：使用 standard cosine annealing logic
+            k = self.end_k + 0.5 * (self.start_k - self.end_k) * (1 + math.cos(progress * math.pi))
+            
+        elif self.strategy == "step":
+            # 阶梯衰减：每过 1/3 阶段减半，或者自定义
+            # 这里简单实现：前50%用 start_k，后50%线性降到 end_k
+            if progress < 0.5:
+                k = self.start_k
+            else:
+                ratio = (progress - 0.5) * 2
+                k = self.start_k - (self.start_k - self.end_k) * ratio
+        else:
+            k = self.start_k
+
+        return int(k)
 class Trainer:
     """GRPO (Group Relative Policy Optimization) Trainer."""
 
@@ -138,7 +190,22 @@ class Trainer:
         self.kl_coef = float(self.train_cfg.get("kl_coef", 0.0))
 
         # Top-k参数
-        self.train_top_k = int(self.train_cfg.get("train_top_k", self.backtest_cfg.get("top_k", 10)))
+        # --- Top-K Scheduler Params ---
+        self.start_top_k = int(self.train_cfg.get("train_top_k", 10))
+        # 如果没配置 min_train_top_k，默认不衰减 (end_k = start_k)
+        self.end_top_k = int(self.train_cfg.get("min_train_top_k", self.start_top_k))
+        self.k_decay_strategy = self.train_cfg.get("k_decay_strategy", "linear")
+
+        # 初始化调度器
+        self.k_scheduler = TopKScheduler(
+            start_k=self.start_top_k,
+            end_k=self.end_top_k,
+            total_epochs=self.epochs,
+            strategy=self.k_decay_strategy
+        )
+        
+        # 初始 current_k
+        self.current_train_k = self.start_top_k
         self.temperature = float(self.train_cfg.get("temperature", 1.0))
 
         self.global_step = 0
@@ -332,6 +399,8 @@ class Trainer:
 
         try:
             for epoch in range(1, self.epochs + 1):
+                # --- [新增] 更新 Top-K ---
+                self.current_train_k = self.k_scheduler.get_k(epoch)
                 train_stats = self._run_epoch(train_loader, epoch)
                 self.logger.log_metrics("train_epoch", {"epoch": epoch, **train_stats})
 
@@ -405,7 +474,7 @@ class Trainer:
             with torch.no_grad():
                 sampled_masks, old_log_probs = sample_topk_actions(
                     logits, mask, 
-                    top_k=self.train_top_k, 
+                    top_k=self.current_train_k, 
                     group_size=self.group_size, 
                     temperature=self.temperature
                 )
