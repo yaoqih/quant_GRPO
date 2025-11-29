@@ -1,0 +1,75 @@
+# quant_GRPO
+
+基于 [qlib](https://github.com/microsoft/qlib) 的 Transformer + GRPO T+1 日线轮仓策略实验脚手架，包含数据预处理、模型训练、策略回测三个阶段的统一配置。
+
+## 快速上手
+
+1. 安装依赖
+   ```bash
+   pip install -e qlib/  # 安装仓库自带的qlib源码
+   pip install torch pandas pyyaml
+   ```
+2. 准备日频数据（可以在数据下载完成后执行）
+   ```bash
+   python qlib/scripts/get_data.py qlib_data_cn --target_dir data/qlib_1d
+   ```
+3. 启动训练（默认使用 `pipelines/transformer_grpo/config_cn_t1.yaml`）
+   ```bash
+   python -m pipelines.transformer_grpo.trainer \
+     --config pipelines/transformer_grpo/config_cn_t1.yaml
+   ```
+   - 训练日志、指标与模型 `state_dict` 将保存到 `runs/transformer_grpo/<timestamp>/`。
+4. 使用已保存的 checkpoint 回测指定时间段（可选 top-k、多仓/持仓阈值等）
+   ```bash
+   python -m pipelines.transformer_grpo.run_backtest \
+     --config pipelines/transformer_grpo/config_cn_t1.yaml \
+     --checkpoint runs/transformer_grpo/<timestamp>/best.pt \
+     --segment test --out_dir runs/eval/test \
+     --top_k 3 --hold_threshold 0.45 --min_weight 0.05 \
+     --max_gross_exposure 1.0 --cash_token CASH
+   ```
+
+> 数据仍在下载时，可以先修改配置、熟悉 workflow；训练脚本会在检测到 segment 为空时直接报错，避免误跑。
+
+## Workflow 结构
+
+- `pipelines/transformer_grpo/data_pipeline.py`
+  - 通过 `DailyBatchFactory` 把 qlib `DataHandler` 输出的多层索引表转换成“按交易日切片”的 `DailyBatch`，并完成 T+1 轮动策略所需的特征+收益标签对齐。
+  - 支持多项增强：按配置自动生成特征滞后项、Rolling 均值/波动率、过去多日累计收益 proxy（不会泄露未来信息）、哈希型股票/行业 embedding，以及可选的「现金」token（收益为 0）来表示空仓。
+  - `DailyBatchDataset` 暴露 `calendar`、`feature_dim` 等元信息，供 PyTorch `DataLoader` 与回测模块共享；walk-forward 评估段也在此统一构建。
+
+- `pipelines/transformer_grpo/model.py`
+  - `TransformerPolicy`：跨截面的 Transformer Encoder，将同一交易日所有股票特征视作 token，产生 action logits 与 value 估计。
+  - `act` 方法支持温度采样与贪婪决策，可输出用于 top-k 组合构建的概率分布；配合增强特征能更好地捕捉跨期与跨行业关联。
+
+- `pipelines/transformer_grpo/trainer.py`
+  - `GRPOTrainer` 将 GRPO（群体相对优势）目标与 value baseline、entropy bonus 组合，形成强化学习式损失；新版默认启用 critic baseline、log-ratio 限幅、KL 自适应调节以及线性/二次 turnover 惩罚。
+  - 训练过程中实时跟踪组合 NAV、最大回撤与实现波动率，可选 drawdown/vol 惩罚；支持 Cosine LR、EMA 参数平均、早停以及 walk-forward 评估。
+  - 自动创建工作目录、保存配置、周期性评估，并在验证集上基于 Sharpe（默认可在配置中修改）挑选最佳模型，必要时使用 EMA 权重回测。
+
+- `pipelines/transformer_grpo/backtest.py` & `run_backtest.py`
+  - `run_policy_on_dataset` 顺序遍历 `DailyBatch`，根据模型输出的跨截面分布构建 top-k 权重组合，可配置最低权重、持仓阈值维持前一日头寸、最大总仓位以及现金 token；换手将计入佣金/滑点。
+  - `run_backtest` 汇总收益率、净值曲线，`compute_performance` 计算累计收益、年化、Sharpe、最大回撤、胜率、换手等指标，并以 CSV/JSON 的形式落盘。命令行参数 `--top_k/--hold_threshold/--min_weight/--max_gross_exposure/--cash_token` 可覆盖配置。
+
+## 配置说明
+
+`pipelines/transformer_grpo/config_cn_t1.yaml` 覆盖了整个流水线所需参数，主要分为：
+
+- `qlib`: 指定数据目录、地区等；默认指向 `./data/qlib_1d`。
+- `data`: 
+  - `handler` 部分完全复用 qlib 的 `Alpha360` 配置，可以按需替换为自定义 handler（例如加入更多 Alpha 因子、限制股票池等）。
+  - `segments` 定义训练/验证/测试区间，均可随意拆分。
+  - `label` 表达式默认是 “次日开盘/前日开盘 - 1”，符合 T+1 换仓逻辑；若需要用次日收盘收益或包含手续费，只要修改 Label 表达式即可。pipelines 会读取 handler 配置里的 `label` 列表尝试匹配返回的列名，若无法匹配则退回到首列，也可在 `label_name` 中手动指定。
+  - `min_instruments` / `max_instruments` 控制每日候选股票上限，避免在超大股票池上训练导致显存不足。
+  - `augment` 块用于控制特征增强（滚动窗口、滞后特征、未来收益 proxy、embedding、现金 token 等）；`walk_forward_segments` 可额外指定回测窗口用于训练结束后的 walk-forward 分析。
+  - `feature_dtype` 用于设置 `DailyBatch` 在内存中的精度（例如 `float16` 可把样本缓存占用直接减半，collate 时仍会转成 `float32` 喂入模型）。
+  - `cache` 块可开启按日落盘缓存：启用后每日的截面样本会序列化到 `cache.root/<segment>/<date>.npz`，训练过程中按需读取，避免一次性把所有交易日加载到内存。`reuse_existing` 会在配置一致（包含 handler 归一化参数、增强设置、dtype 等都哈希签名校验）时直接复用已有缓存；`force_refresh` 可在需要重建缓存时显式清空。可通过 `compress` 控制是否使用 `np.savez_compressed`，如需进一步减小体积可配合 `feature_dtype: float16`。
+- `model`: Transformer 结构超参。
+- `training`: GRPO 训练参数（学习率、熵系数、温度、监控指标等），以及输出目录。新增 `log_ratio_clip`、`kl_target/kl_beta`（自适应 KL）、`turnover_coef/turnover_quad_coef`、`drawdown_coef`、`volatility_coef`、`max_drawdown_target`、`early_stop_patience`、`use_cosine_lr`、`ema_decay`、`eval_with_ema` 等字段，用于控制 PPO 稳定性、风险偏好及训练日程。
+- `backtest`: 提供默认的回测段落及交易成本假设（`commission/slippage`），同时支持 `top_k`、`hold_threshold`、`min_weight`、`cash_token`、`max_gross_exposure` 等多仓配置；`run_backtest.py` 可在命令行覆盖这些值。
+
+## 下一步可以做什么
+
+- 在数据下载完成后，更新 `config_cn_t1.yaml` 中的 `segments` 时间范围和股票池，确保覆盖目标训练集。
+- 如果需要引入更复杂的行情特征（分钟级别、财务因子等），只需在 qlib handler 中扩展 feature/processor，然后复用 `DailyBatchFactory` 即可。
+- 结合交易端需求，可以在 `run_backtest.py` 中增加生成实盘下单所需信号、或接入已有的订单模拟器。

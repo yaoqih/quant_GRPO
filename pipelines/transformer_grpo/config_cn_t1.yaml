@@ -1,0 +1,104 @@
+qlib:
+  provider_uri: ./data/qlib_1d_c
+  region: cn
+  expression_cache: null
+  dataset_cache: null
+
+data:
+  handler:
+    class: Alpha158
+    module_path: qlib.contrib.data.handler
+    kwargs:
+      instruments: all
+      start_time: 2022-01-01
+      end_time: 2025-01-01
+      fit_start_time: 2022-01-01
+      fit_end_time: 2025-12-31
+      freq: day
+      infer_processors:
+        - class: RobustZScoreNorm
+          kwargs:
+            fields_group: feature
+            clip_outlier: true
+        - class: Fillna
+          kwargs:
+            fields_group: feature
+      learn_processors:
+        - class: DropnaLabel
+      label:
+        - "Ref($open, -2) / Ref($open, -1) - 1"
+  segments:
+    train: ["2022-01-01", "2022-12-31"]
+    valid: ["2023-01-01", "2023-12-31"]
+    test: ["2024-01-01", "2024-12-31"]
+  feature_group: feature
+  label_group: label
+  feature_dtype: float32
+  min_instruments: 30
+  max_instruments: 3000
+  reward:
+    clip: [-0.08, 0.08]
+  augment:
+    temporal_span: 20
+    include_cash_token: true
+    cash_return: 0.0
+    cash_token: "CASH"
+    cache:
+      enable: true
+      root: runs/daily_batch_cache
+      compress: true
+      feature_dtype: float32
+      reuse_existing: true
+      force_refresh: false
+      # num_workers removed - using synchronous cache writes for lower memory
+
+model:
+  d_model: 256
+  nhead: 4
+  num_layers: 4
+  dropout: 0.1
+  ff_multiplier: 4
+  temporal_nhead: 4
+  temporal_layers: 2
+
+training:
+  seed: 42
+  device: auto
+  epochs: 40
+  batch_size: 4
+  learning_rate: 0.0005
+  weight_decay: 0.01
+  entropy_coef: 0.01
+  rank_coef: 1.0
+  group_size: 16
+  clip_ratio: 0.2
+  kl_coef: 0.05
+  grad_clip: 1.0
+  early_stop_patience: 20
+  pretrain_epochs: 3
+  checkpoint_root: runs/transformer_grpo
+  log_interval: 50
+  use_cosine_lr: true
+  temperature: 1.0
+  train_top_k: 100
+
+  dataloader:
+    num_workers: 12
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 4
+    prefetch_batches: 8
+    async_device_transfer: true
+
+  logger:
+    type: wandb
+    project: transformer_grpo
+    mode: online
+
+backtest:
+  segment: test
+  commission: 0.0
+  slippage: 0.0
+  top_k: 1
+  min_weight: 0.02
+  temperature: 0.5
