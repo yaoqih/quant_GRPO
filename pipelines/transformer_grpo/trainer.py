@@ -170,7 +170,6 @@ class Trainer:
             reward_clip=reward_clip,
             reward_scale=float(self.data_cfg.get("reward", {}).get("scale", 1.0)),
             augment=self.data_cfg.get("augment"),
-            cache_config=self.data_cfg.get("augment", {}).get("cache"),
             feature_dtype=self.data_cfg.get("feature_dtype", "float32"),
         )
 
