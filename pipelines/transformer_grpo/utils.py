@@ -205,39 +205,39 @@ def sample_topk_actions(
     temperature: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Sample 'group_size' actions for each batch item using Multinomial sampling.
-    Robust version handling K > valid_count.
+    Sample `group_size` actions for each batch item (independent sets) via Gumbel-TopK.
+    Fully vectorized to keep sampling on GPU.
     """
     batch_size, num_inst = logits.shape
     temperature = max(float(temperature), 1e-4)
     masked_logits = logits.masked_fill(~mask, -1e9)
+    log_probs = F.log_softmax(masked_logits / temperature, dim=-1)  # [B, N]
 
-    sampled_masks = torch.zeros(batch_size, group_size, num_inst, dtype=torch.bool, device=logits.device)
-    sample_log_probs = torch.zeros(batch_size, group_size, device=logits.device)
+    if top_k <= 0 or group_size <= 0:
+        empty_mask = torch.zeros(batch_size, group_size, num_inst, dtype=torch.bool, device=logits.device)
+        empty_logprob = torch.zeros(batch_size, group_size, device=logits.device)
+        return empty_mask, empty_logprob
 
-    for b in range(batch_size):
-        valid_count = int(mask[b].sum().item())
-        if valid_count == 0:
-            continue
+    gumbel_shape = (batch_size, group_size, num_inst)
+    # Avoid log(0) by clamping to tiny positive number
+    uniform = torch.rand(gumbel_shape, device=logits.device).clamp_(min=1e-9, max=1 - 1e-9)
+    gumbels = -torch.log(-torch.log(uniform))
 
-        for g in range(group_size):
-            remaining_mask = mask[b].clone()
-            picks = min(top_k, valid_count)
-            log_prob = torch.tensor(0.0, device=logits.device)
+    scores = log_probs.unsqueeze(1) + gumbels  # [B, G, N]
+    scores = scores.masked_fill(~mask.unsqueeze(1), float("-inf"))
 
-            for _ in range(picks):
-                if not bool(remaining_mask.any().item()):
-                    break
-                step_logits = masked_logits[b].masked_fill(~remaining_mask, -1e9)
-                step_scores = step_logits / temperature
-                step_log_probs = F.log_softmax(step_scores, dim=-1)
-                probs = step_log_probs.exp()
-                action = torch.multinomial(probs, num_samples=1).item()
-                sampled_masks[b, g, action] = True
-                log_prob = log_prob + step_log_probs[action]
-                remaining_mask[action] = False
+    k = min(int(top_k), num_inst)
+    _, topk_idx = torch.topk(scores, k=k, dim=-1)
 
-            sample_log_probs[b, g] = log_prob
+    repeated_mask = mask.unsqueeze(1).expand_as(scores)
+    valid_flags = torch.gather(repeated_mask, 2, topk_idx)
+
+    sampled_masks = torch.zeros_like(scores, dtype=torch.bool)
+    sampled_masks.scatter_(2, topk_idx, valid_flags)
+
+    expanded_log_probs = log_probs.unsqueeze(1).expand_as(scores)
+    selected_log_probs = torch.gather(expanded_log_probs, 2, topk_idx)
+    sample_log_probs = (selected_log_probs * valid_flags.float()).sum(dim=-1)
 
     return sampled_masks, sample_log_probs
 
