@@ -114,6 +114,12 @@ class TransformerPolicy(nn.Module):
 
         # 输出头
         self.policy_head = nn.Linear(d_model, 1)
+        self._init_weights()
+    def _init_weights(self):
+        """Xavier 初始化，有助于模型快速收敛"""
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
 
     def forward(self, features: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, None]:
         """

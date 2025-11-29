@@ -6,7 +6,7 @@ qlib:
 
 data:
   handler:
-    class: Alpha360
+    class: Alpha158
     module_path: qlib.contrib.data.handler
     kwargs:
       instruments: all
@@ -28,7 +28,7 @@ data:
       label:
         - "Ref($open, -2) / Ref($open, -1) - 1"
   segments:
-    train: ["2010-01-01", "2010-12-31"]
+    train: ["2010-01-01", "2022-12-31"]
     valid: ["2023-01-01", "2023-12-31"]
     test: ["2024-01-01", "2024-12-31"]
   feature_group: feature
