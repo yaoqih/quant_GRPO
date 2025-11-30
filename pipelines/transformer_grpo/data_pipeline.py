@@ -51,16 +51,13 @@ class DailyBatch:
     feature_dtype: np.dtype = np.float32
 
     def materialize(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if self.features is not None and self.rewards is not None:
-            raw = self.raw_rewards if self.raw_rewards is not None else self.rewards
-            return self.features, self.rewards, raw
+        if self.features is not None and self.rewards is not None and self.raw_rewards is not None:
+            return self.features, self.rewards, self.raw_rewards
+        if self.features is not None and self.rewards is not None and self.raw_rewards is None:
+            return self.features, self.rewards, self.rewards
         if self.loader is None:
             raise ValueError("DailyBatch is missing loader for dynamic materialization.")
-        features, rewards, raw_rewards = self.loader.build_window(self)
-        self.features = features
-        self.rewards = rewards
-        self.raw_rewards = raw_rewards
-        return features, rewards, raw_rewards
+        return self.loader.build_window(self)
 
 
 class DailyBatchDataset(Dataset):
