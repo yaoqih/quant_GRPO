@@ -24,6 +24,7 @@ class CrossSection:
     instruments: np.ndarray
     features: np.ndarray
     rewards: np.ndarray
+    raw_rewards: np.ndarray
     index_map: Dict[str, int]
     feature_dim: int
 
@@ -36,6 +37,7 @@ class DailyBatch:
     instruments: np.ndarray
     features: Optional[np.ndarray]
     rewards: Optional[np.ndarray]
+    raw_rewards: Optional[np.ndarray] = None
     feature_shape: Tuple[int, ...] = field(default_factory=tuple)
     window_dates: Sequence[pd.Timestamp] = field(default_factory=list)
     index_slices: Optional[Sequence[np.ndarray]] = None
@@ -48,12 +50,17 @@ class DailyBatch:
     cash_token_name: str = "CASH"
     feature_dtype: np.dtype = np.float32
 
-    def materialize(self) -> Tuple[np.ndarray, np.ndarray]:
+    def materialize(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self.features is not None and self.rewards is not None:
-            return self.features, self.rewards
+            raw = self.raw_rewards if self.raw_rewards is not None else self.rewards
+            return self.features, self.rewards, raw
         if self.loader is None:
             raise ValueError("DailyBatch is missing loader for dynamic materialization.")
-        return self.loader.build_window(self)
+        features, rewards, raw_rewards = self.loader.build_window(self)
+        self.features = features
+        self.rewards = rewards
+        self.raw_rewards = raw_rewards
+        return features, rewards, raw_rewards
 
 
 class DailyBatchDataset(Dataset):
@@ -137,6 +144,8 @@ class RollingWindowLoader:
             final_idx = self._indices_for(final_entry, base_instruments)
         rewards = np.asarray(final_entry.rewards[final_idx], dtype=np.float32, copy=False)
         rewards = np.nan_to_num(rewards, nan=0.0, posinf=0.0, neginf=0.0)
+        raw_rewards = np.asarray(final_entry.raw_rewards[final_idx], dtype=np.float32, copy=False)
+        raw_rewards = np.nan_to_num(raw_rewards, nan=0.0, posinf=0.0, neginf=0.0)
 
         if batch.include_cash_token:
             cash_feat = np.full(
@@ -146,8 +155,9 @@ class RollingWindowLoader:
             )
             stacked = np.concatenate([stacked, cash_feat], axis=0)
             rewards = np.concatenate([rewards, np.array([batch.cash_return], dtype=np.float32)])
+            raw_rewards = np.concatenate([raw_rewards, np.array([batch.cash_return], dtype=np.float32)])
 
-        return stacked, rewards
+        return stacked, rewards, raw_rewards
 
     @staticmethod
     def _indices_for(entry: CrossSection, instruments: np.ndarray) -> np.ndarray:
@@ -294,21 +304,24 @@ class DailyBatchFactory:
                 if day_instruments.size == 0:
                     continue
 
-                if self.reward_norm_type == "zscore":
-                    mean = float(np.mean(day_rewards))
-                    std = float(np.std(day_rewards))
-                    if std < self.reward_norm_eps:
-                        day_rewards = day_rewards - mean
-                    else:
-                        day_rewards = (day_rewards - mean) / max(std, self.reward_norm_eps)
-
+                raw_rewards = day_rewards.astype(np.float32, copy=True)
                 if self.reward_clip is not None:
-                    day_rewards = np.clip(day_rewards, self.reward_clip[0], self.reward_clip[1])
+                    raw_rewards = np.clip(raw_rewards, self.reward_clip[0], self.reward_clip[1])
                 if self.reward_scale != 1.0:
-                    day_rewards = day_rewards * self.reward_scale
+                    raw_rewards = raw_rewards * self.reward_scale
+
+                norm_rewards = raw_rewards.astype(np.float32, copy=True)
+                if self.reward_norm_type == "zscore":
+                    mean = float(np.mean(norm_rewards))
+                    std = float(np.std(norm_rewards))
+                    if std < self.reward_norm_eps:
+                        norm_rewards = norm_rewards - mean
+                    else:
+                        norm_rewards = (norm_rewards - mean) / max(std, self.reward_norm_eps)
 
                 day_feats = np.nan_to_num(day_feats, nan=0.0, posinf=0.0, neginf=0.0)
-                day_rewards = np.nan_to_num(day_rewards, nan=0.0, posinf=0.0, neginf=0.0)
+                norm_rewards = np.nan_to_num(norm_rewards, nan=0.0, posinf=0.0, neginf=0.0)
+                raw_rewards = np.nan_to_num(raw_rewards, nan=0.0, posinf=0.0, neginf=0.0)
 
                 instruments = day_instruments.astype(object, copy=True)
                 index_map = {inst: idx for idx, inst in enumerate(instruments)}
@@ -317,7 +330,8 @@ class DailyBatchFactory:
                     date=current_date,
                     instruments=instruments,
                     features=day_feats,
-                    rewards=day_rewards,
+                    rewards=norm_rewards,
+                    raw_rewards=raw_rewards,
                     index_map=index_map,
                     feature_dim=day_feats.shape[1],
                 )

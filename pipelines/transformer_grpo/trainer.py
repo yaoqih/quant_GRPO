@@ -145,7 +145,7 @@ class TopKScheduler:
         else:
             k = self.start_k
 
-        return int(k)
+        return max(1, int(round(k)))
 class Trainer:
     """GRPO (Group Relative Policy Optimization) Trainer."""
 
@@ -180,7 +180,9 @@ class Trainer:
         self.epochs = int(self.train_cfg.get("epochs", 40))
         self.batch_size = int(self.train_cfg.get("batch_size", 4))
         self.entropy_coef = float(self.train_cfg.get("entropy_coef", 0.01))
-        self.rank_coef = float(self.train_cfg.get("rank_coef", 0.0))
+        self.rank_coef_start = float(self.train_cfg.get("rank_coef", 0.0))
+        self.rank_coef_final = float(self.train_cfg.get("rank_coef_final", self.rank_coef_start))
+        self.rank_coef_decay_epochs = max(1, int(self.train_cfg.get("rank_coef_decay_epochs", self.epochs)))
         self.grad_clip = float(self.train_cfg.get("grad_clip", 1.0))
         self.early_stop_patience = int(self.train_cfg.get("early_stop_patience", 20))
         self.log_interval = int(self.train_cfg.get("log_interval", 50))
@@ -229,6 +231,13 @@ class Trainer:
         if torch.cuda.is_available() and requested in ("auto", "cuda", "gpu"):
             return torch.device("cuda")
         return torch.device("cpu")
+
+    def _rank_coef_for_epoch(self, epoch: int) -> float:
+        if self.rank_coef_start == self.rank_coef_final:
+            return self.rank_coef_start
+        span = max(self.rank_coef_decay_epochs - 1, 1)
+        progress = min(max((epoch - 1) / span, 0.0), 1.0)
+        return self.rank_coef_start + (self.rank_coef_final - self.rank_coef_start) * progress
 
     def _build_datasets(self):
         """构建数据集，顺序处理以减少内存峰值。"""
@@ -464,6 +473,7 @@ class Trainer:
         total_updates = 0
         batch_count = 0
 
+        rank_coef_value = self._rank_coef_for_epoch(epoch)
         pbar = tqdm(loader, desc=f"[Train] Epoch {epoch}")
         for step, batch in enumerate(pbar, start=1):
             features, rewards, mask = self._move_batch_to_device(batch)
@@ -524,12 +534,12 @@ class Trainer:
                 entropy = -(probs * all_log_probs).sum(dim=-1).mean()
 
                 rank_loss = None
-                if self.rank_coef > 0:
+                if rank_coef_value > 0:
                     rank_loss = compute_listmle_loss_vectorized(logits, rewards, mask)
 
                 loss = pg_loss - self.entropy_coef * entropy + self.kl_coef * kl_div
                 if rank_loss is not None:
-                    loss = loss + self.rank_coef * rank_loss
+                    loss = loss + rank_coef_value * rank_loss
 
                 if torch.isnan(loss) or torch.isinf(loss):
                     print(f"[Warning] NaN/Inf loss at step {step} (ppo_iter {ppo_epoch}), skipping")
@@ -570,6 +580,7 @@ class Trainer:
                         "epoch": epoch,
                         "epoch_step": step,
                         "train_top_k": self.current_train_k,
+                        "rank_coef": rank_coef_value,
                     }
                     self.logger.log_metrics("train_step", step_metrics, step=self.global_step)
                     pbar.set_postfix(
@@ -580,7 +591,7 @@ class Trainer:
 
         n_updates = max(total_updates, 1)
         n_batches = max(batch_count, 1)
-        avg_rank_loss = total_rank_loss / n_updates if self.rank_coef > 0 else 0.0
+        avg_rank_loss = total_rank_loss / n_updates if rank_coef_value > 0 else 0.0
         return {
             "loss": total_loss / n_updates,
             "pg_loss": total_pg_loss / n_updates,

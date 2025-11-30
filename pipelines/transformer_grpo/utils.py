@@ -267,13 +267,16 @@ def collate_daily_batches(samples: List[DailyBatch]) -> Dict[str, object]:
     mask = torch.zeros(batch_size, max_tokens, dtype=torch.bool)
     metadata: List[Dict[str, object]] = []
 
+    raw_rewards = torch.zeros(batch_size, max_tokens, dtype=torch.float32)
+
     for idx, sample in enumerate(samples):
-        feat, rew = sample.materialize()
+        feat, rew, raw = sample.materialize()
         length = feat.shape[0]
         if feat.ndim == 2:
             feat = feat[:, np.newaxis, :]
         features[idx, :length] = torch.from_numpy(feat.astype(np.float32, copy=False))
         rewards[idx, :length] = torch.from_numpy(rew.astype(np.float32, copy=False))
+        raw_rewards[idx, :length] = torch.from_numpy(raw.astype(np.float32, copy=False))
         mask[idx, :length] = True
         metadata.append(
             {
@@ -285,6 +288,7 @@ def collate_daily_batches(samples: List[DailyBatch]) -> Dict[str, object]:
     return {
         "features": features,
         "rewards": rewards,
+        "raw_rewards": raw_rewards,
         "mask": mask,
         "meta": metadata,
     }
@@ -295,7 +299,7 @@ def _infer_sample_shape(sample: DailyBatch) -> Tuple[int, ...]:
         return sample.feature_shape
     if sample.features is not None:
         return sample.features.shape
-    feat, _ = sample.materialize()
+    feat, _, _ = sample.materialize()
     return feat.shape
 
 

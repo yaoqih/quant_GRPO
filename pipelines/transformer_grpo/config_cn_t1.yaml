@@ -74,9 +74,11 @@ training:
   weight_decay: 0.01
   entropy_coef: 0.001
   rank_coef: 0.05
+  rank_coef_final: 0.0
+  rank_coef_decay_epochs: 10
   group_size: 4
   clip_ratio: 0.2
-  kl_coef: 0.01
+  kl_coef: 0.003
   grad_clip: 1.0
   early_stop_patience: 20
   pretrain_epochs: 3
