@@ -237,7 +237,8 @@ class Trainer:
             raise ValueError("`data.handler` must be provided in config.")
 
         segments = self.data_cfg.get("segments", {})
-        reward_clip = self.data_cfg.get("reward", {}).get("clip")
+        reward_cfg = self.data_cfg.get("reward", {}) or {}
+        reward_clip = reward_cfg.get("clip")
         if reward_clip is not None:
             reward_clip = (float(reward_clip[0]), float(reward_clip[1]))
 
@@ -249,7 +250,8 @@ class Trainer:
             min_instruments=int(self.data_cfg.get("min_instruments", 30)),
             max_instruments=self.data_cfg.get("max_instruments"),
             reward_clip=reward_clip,
-            reward_scale=float(self.data_cfg.get("reward", {}).get("scale", 1.0)),
+            reward_scale=float(reward_cfg.get("scale", 1.0)),
+            reward_normalize=reward_cfg.get("normalize"),
             augment=self.data_cfg.get("augment"),
             feature_dtype=self.data_cfg.get("feature_dtype", "float32"),
         )
@@ -496,6 +498,7 @@ class Trainer:
 
             advantages = advantages.detach()
             sampled_mask_float = sampled_mask_float.detach()
+            selected_counts = selected_counts.detach()
             adv_mean_value = advantages.mean().item()
             adv_std_value = advantages.std(unbiased=False).item()
             avg_return_value = (avg_batch_return / self.reward_scale).item()
@@ -508,7 +511,8 @@ class Trainer:
                 masked_logits = logits.masked_fill(~mask, -1e9)
                 all_log_probs = F.log_softmax(masked_logits / self.temperature, dim=-1)
                 all_log_probs_exp = all_log_probs.unsqueeze(1).expand(-1, self.group_size, -1)
-                new_log_probs = (all_log_probs_exp * sampled_mask_float).sum(dim=-1)
+                numerator = (all_log_probs_exp * sampled_mask_float).sum(dim=-1)
+                new_log_probs = numerator / selected_counts
 
                 ratio = torch.exp(new_log_probs - old_log_probs)
                 surr1 = ratio * advantages

@@ -237,7 +237,9 @@ def sample_topk_actions(
 
     expanded_log_probs = log_probs.unsqueeze(1).expand_as(scores)
     selected_log_probs = torch.gather(expanded_log_probs, 2, topk_idx)
-    sample_log_probs = (selected_log_probs * valid_flags.float()).sum(dim=-1)
+    valid_float = valid_flags.float()
+    counts = valid_float.sum(dim=-1).clamp_min(1.0)
+    sample_log_probs = (selected_log_probs * valid_float).sum(dim=-1) / counts
 
     return sampled_masks, sample_log_probs
 

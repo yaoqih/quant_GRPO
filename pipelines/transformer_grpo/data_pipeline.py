@@ -174,6 +174,7 @@ class DailyBatchFactory:
         max_instruments: Optional[int] = None,
         reward_clip: Optional[Tuple[float, float]] = None,
         reward_scale: float = 1.0,
+        reward_normalize: Optional[Dict] = None,
         instrument_universe: Optional[Iterable[str]] = None,
         augment: Optional[Dict] = None,
         feature_dtype: str = "float32",
@@ -187,6 +188,9 @@ class DailyBatchFactory:
         self.max_instruments = max_instruments
         self.reward_clip = reward_clip
         self.reward_scale = reward_scale
+        self.reward_normalize = reward_normalize or {}
+        self.reward_norm_type = (self.reward_normalize.get("type") or "").lower()
+        self.reward_norm_eps = float(self.reward_normalize.get("eps", 1e-6))
         if instrument_universe is not None:
             inst_list = [str(inst) for inst in instrument_universe]
             self.instrument_universe = set(inst_list)
@@ -289,6 +293,14 @@ class DailyBatchFactory:
 
                 if day_instruments.size == 0:
                     continue
+
+                if self.reward_norm_type == "zscore":
+                    mean = float(np.mean(day_rewards))
+                    std = float(np.std(day_rewards))
+                    if std < self.reward_norm_eps:
+                        day_rewards = day_rewards - mean
+                    else:
+                        day_rewards = (day_rewards - mean) / max(std, self.reward_norm_eps)
 
                 if self.reward_clip is not None:
                     day_rewards = np.clip(day_rewards, self.reward_clip[0], self.reward_clip[1])

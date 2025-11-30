@@ -9,7 +9,7 @@ data:
     class: Alpha158
     module_path: qlib.contrib.data.handler
     kwargs:
-      instruments: csi300
+      instruments: all
       start_time: 2010-01-01
       end_time: 2025-01-01
       fit_start_time: 2010-01-01
@@ -26,7 +26,7 @@ data:
       learn_processors:
         - class: DropnaLabel
       label:
-        - "Ref($open, -2) / Ref($open, -1) - 1"
+        - "Ref($close, -1) / Ref($open, -1) - 1"
   segments:
     train: ["2010-01-01", "2022-12-31"]
     valid: ["2023-01-01", "2023-12-31"]
@@ -37,8 +37,11 @@ data:
   min_instruments: 30
   max_instruments: 3000
   reward:
-    clip: [-0.08, 0.08]
-    scale: 100.0
+    clip: [-4.0, 4.0]
+    scale: 1.0
+    normalize:
+      type: zscore
+      eps: 1.0e-06
   augment:
     temporal_span: 20
     include_cash_token: true
@@ -70,10 +73,10 @@ training:
   learning_rate: 0.0005
   weight_decay: 0.01
   entropy_coef: 0.001
-  rank_coef: 0.0
-  group_size: 8
+  rank_coef: 0.05
+  group_size: 4
   clip_ratio: 0.2
-  kl_coef: 0.05
+  kl_coef: 0.01
   grad_clip: 1.0
   early_stop_patience: 20
   pretrain_epochs: 3
@@ -81,8 +84,8 @@ training:
   log_interval: 50
   use_cosine_lr: true
   temperature: 0.7
-  train_top_k: 30      # 初始 K (Start)
-  min_train_top_k: 10   # 最终 K (End)
+  train_top_k: 12      # 初始 K (Start)
+  min_train_top_k: 6   # 最终 K (End)
   k_decay_strategy: "linear" # linear, cosine, step
   ppo_epochs: 4
 
