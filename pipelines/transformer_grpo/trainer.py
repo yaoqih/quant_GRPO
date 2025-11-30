@@ -156,7 +156,7 @@ class Trainer:
         self.data_cfg = config.get("data", {})
         self.backtest_cfg = config.get("backtest", {})
         reward_cfg = self.data_cfg.get("reward", {}) or {}
-        self.reward_scale = float(reward_cfg.get("scale", 1.0))
+        self.reward_scale = max(float(reward_cfg.get("scale", 1.0)), 1e-6)
 
         # 初始化路径和日志
         self.output_root = Path(self.train_cfg.get("checkpoint_root", "runs/transformer_grpo"))
@@ -498,7 +498,7 @@ class Trainer:
             sampled_mask_float = sampled_mask_float.detach()
             adv_mean_value = advantages.mean().item()
             adv_std_value = advantages.std(unbiased=False).item()
-            avg_return_value = avg_batch_return.item()
+            avg_return_value = (avg_batch_return / self.reward_scale).item()
 
             total_return += avg_return_value
             total_rank_corr += rank_corr_value
@@ -595,6 +595,7 @@ class Trainer:
             min_weight=float(self.backtest_cfg.get("min_weight", 0.0)),
             commission=float(self.backtest_cfg.get("commission", 0.0)),
             slippage=float(self.backtest_cfg.get("slippage", 0.0)),
+            reward_scale=self.reward_scale,
         )
 
         stage_dir = ensure_dir(self.work_dir / stage)

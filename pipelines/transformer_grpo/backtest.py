@@ -23,6 +23,7 @@ def run_backtest(
     min_weight: float = 0.0,
     commission: float = 0.0,
     slippage: float = 0.0,
+    reward_scale: float = 1.0,
     **_kwargs,  # 忽略其他参数保持兼容性
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
     """
@@ -41,6 +42,9 @@ def run_backtest(
     with torch.no_grad():
         for batch in dataset:
             feat_np, reward_np = batch.materialize()
+            scale = reward_scale if reward_scale and reward_scale > 1e-12 else 1.0
+            if scale != 1.0:
+                reward_np = reward_np.astype(np.float32, copy=False) / scale
             features = torch.from_numpy(feat_np.astype(np.float32, copy=False)).unsqueeze(0).to(device)
             token_count = feat_np.shape[0]
             mask = torch.ones(1, token_count, dtype=torch.bool, device=device)

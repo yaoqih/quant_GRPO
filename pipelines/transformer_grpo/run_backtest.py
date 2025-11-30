@@ -48,6 +48,8 @@ def main() -> None:
     if max_instruments is not None:
         max_instruments = int(max_instruments)
 
+    reward_scale = float(cfg["data"].get("reward", {}).get("scale", 1.0))
+
     factory = DailyBatchFactory(
         handler_config=handler_cfg,
         segments=segments,
@@ -56,7 +58,7 @@ def main() -> None:
         min_instruments=int(cfg["data"].get("min_instruments", 10)),
         max_instruments=max_instruments,
         reward_clip=reward_clip,
-        reward_scale=float(cfg["data"].get("reward", {}).get("scale", 1.0)),
+        reward_scale=reward_scale,
         augment=cfg["data"].get("augment"),
         feature_dtype=cfg["data"].get("feature_dtype", "float32"),
     )
@@ -86,6 +88,7 @@ def main() -> None:
         slippage=float(backtest_cfg.get("slippage", 0.0)),
         top_k=top_k,
         min_weight=min_weight,
+        reward_scale=reward_scale,
     )
 
     out_dir = ensure_dir(args.out_dir)

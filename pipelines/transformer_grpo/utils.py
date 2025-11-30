@@ -313,9 +313,13 @@ def compute_performance(trades: pd.DataFrame, risk_free: float = 0.02) -> Dict[s
 
     daily_returns = trades["reward"].to_numpy()
     nav = trades["nav"].to_numpy() if "nav" in trades else np.cumprod(1.0 + daily_returns)
-    total_return = float(nav[-1] - 1.0)
+    final_nav = float(nav[-1])
+    total_return = final_nav - 1.0
     trading_days = max(len(daily_returns), 1)
-    ann_return = float((1.0 + total_return) ** (252.0 / trading_days) - 1.0)
+    if final_nav <= 0:
+        ann_return = -1.0
+    else:
+        ann_return = float(final_nav ** (252.0 / trading_days) - 1.0)
     mean_daily = float(np.mean(daily_returns))
     std_daily = float(np.std(daily_returns) + 1e-9)
     sharpe = ((mean_daily - risk_free / 252.0) / std_daily) * math.sqrt(252.0)
