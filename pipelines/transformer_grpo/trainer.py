@@ -155,6 +155,8 @@ class Trainer:
         self.model_cfg = config.get("model", {})
         self.data_cfg = config.get("data", {})
         self.backtest_cfg = config.get("backtest", {})
+        reward_cfg = self.data_cfg.get("reward", {}) or {}
+        self.reward_scale = float(reward_cfg.get("scale", 1.0))
 
         # 初始化路径和日志
         self.output_root = Path(self.train_cfg.get("checkpoint_root", "runs/transformer_grpo"))
@@ -183,9 +185,12 @@ class Trainer:
         self.early_stop_patience = int(self.train_cfg.get("early_stop_patience", 20))
         self.log_interval = int(self.train_cfg.get("log_interval", 50))
         self.pretrain_epochs = int(self.train_cfg.get("pretrain_epochs", 5))
+        default_pretrain_scale = 100.0 if self.reward_scale == 1.0 else 1.0
+        self.pretrain_value_scale = float(self.train_cfg.get("pretrain_value_scale", default_pretrain_scale))
 
         # GRPO Params
         self.group_size = int(self.train_cfg.get("group_size", 4))
+        self.ppo_epochs = max(1, int(self.train_cfg.get("ppo_epochs", 1)))
         self.clip_ratio = float(self.train_cfg.get("clip_ratio", 0.2))
         self.kl_coef = float(self.train_cfg.get("kl_coef", 0.0))
 
@@ -362,14 +367,10 @@ class Trainer:
                 listmle_loss = compute_listmle_loss_vectorized(logits, rewards, mask)
                 
                 # 2. MSE Loss (Value stability)
-                # Logits are unbounded, rewards are small [-0.1, 0.1]. 
-                # We might want to scale rewards or just let the model learn.
-                # Masking for MSE
                 masked_logits = logits[mask]
                 masked_rewards = rewards[mask]
-                # Scale up rewards for numerical stability in MSE? 
-                # Or just use it as is. 
-                mse = mse_loss_fn(masked_logits, masked_rewards * 100.0) # Simple scaling
+                target_rewards = masked_rewards * self.pretrain_value_scale
+                mse = mse_loss_fn(masked_logits, target_rewards)
                 
                 loss = listmle_loss + 0.1 * mse
                 
@@ -458,148 +459,132 @@ class Trainer:
         total_kl = 0.0
         total_return = 0.0
         total_rank_corr = 0.0
-        total_steps = 0
+        total_updates = 0
+        batch_count = 0
 
         pbar = tqdm(loader, desc=f"[Train] Epoch {epoch}")
         for step, batch in enumerate(pbar, start=1):
             features, rewards, mask = self._move_batch_to_device(batch)
+            batch_count += 1
 
-            # 1. Policy Forward
-            logits, _ = self.model(features, mask)
-
-            # 2. GRPO Sampling
-            # Sample G actions per batch item
-            # sampled_masks: [batch, group, num_inst] (Boolean)
-            # old_log_probs: [batch, group]
             with torch.no_grad():
+                logits, _ = self.model(features, mask)
+                masked_logits = logits.masked_fill(~mask, -1e9)
+                log_probs = F.log_softmax(masked_logits / self.temperature, dim=-1)
                 sampled_masks, old_log_probs = sample_topk_actions(
-                    logits, mask, 
-                    top_k=self.current_train_k, 
-                    group_size=self.group_size, 
-                    temperature=self.temperature
+                    logits,
+                    mask,
+                    top_k=self.current_train_k,
+                    group_size=self.group_size,
+                    temperature=self.temperature,
                 )
+                sampled_masks = sampled_masks.detach()
+                sampled_mask_float = sampled_masks.float()
+                old_log_probs = old_log_probs.detach()
 
-            # 3. Compute Rewards for Samples
-            # Reward = Average return of selected stocks
-            # rewards: [batch, num_inst]
-            # We expand rewards to [batch, group, num_inst]
-            rewards_expanded = rewards.unsqueeze(1).expand(-1, self.group_size, -1)
-            
-            # Calculate portfolio return for each sample
-            # Note: sampled_masks is boolean. We select average return.
-            selected_rewards = (rewards_expanded * sampled_masks.float()).sum(dim=-1)
-            selected_counts = sampled_masks.sum(dim=-1).clamp(min=1.0)
-            sample_returns = selected_rewards / selected_counts # [batch, group]
-            avg_batch_return = sample_returns.mean()
+                rewards_expanded = rewards.unsqueeze(1).expand(-1, self.group_size, -1)
+                selected_rewards = (rewards_expanded * sampled_mask_float).sum(dim=-1)
+                selected_counts = sampled_mask_float.sum(dim=-1).clamp(min=1.0)
+                sample_returns = selected_rewards / selected_counts
+                avg_batch_return = sample_returns.mean()
+
+                mean_return = sample_returns.mean(dim=1, keepdim=True)
+                std_return = sample_returns.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-3)
+                advantages = (sample_returns - mean_return) / std_return
+
+                rank_corr_value = compute_rank_correlation(logits, rewards, mask).mean().item()
+
+            advantages = advantages.detach()
+            sampled_mask_float = sampled_mask_float.detach()
+            adv_mean_value = advantages.mean().item()
+            adv_std_value = advantages.std(unbiased=False).item()
             avg_return_value = avg_batch_return.item()
 
-            # 4. Compute Advantages (Group Relative)
-            # Mean and Std across the group dimension
-            mean_return = sample_returns.mean(dim=1, keepdim=True)
-            std_return = sample_returns.std(dim=1, keepdim=True)
-            advantages = (sample_returns - mean_return) / (std_return + 1e-8)
-
-            # 5. Policy Gradient Loss (PPO Clip)
-            # We need to re-compute log_probs with gradient
-            
-            # To save memory/compute, we use the logits we already have?
-            # Yes, but we need log_prob of the *sampled* actions.
-            # LogProb = Sum(LogSoftmax * Mask)
-            
-            masked_logits = logits.masked_fill(~mask, -1e9)
-            all_log_probs = F.log_softmax(masked_logits / self.temperature, dim=-1) # [batch, num_inst]
-            
-            # Expand for group: [batch, group, num_inst]
-            all_log_probs_exp = all_log_probs.unsqueeze(1).expand(-1, self.group_size, -1)
-            
-            # Gather log probs of selected items
-            # New Log Prob of the portfolio = Sum of log probs of assets in portfolio
-            new_log_probs = (all_log_probs_exp * sampled_masks.float()).sum(dim=-1) # [batch, group]
-            
-            ratio = torch.exp(new_log_probs - old_log_probs)
-            
-            surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * advantages
-            pg_loss = -torch.min(surr1, surr2).mean()
-
-            # 6. Auxiliary Losses
-            
-            # KL Penalty (Approximate)
-            # KL(old || new) approx (old_log - new_log)
-            # Here we approximate using the sampled points
-            kl_div = (old_log_probs - new_log_probs).mean()
-            
-            # Entropy
-            probs = all_log_probs.exp()
-            entropy = -(probs * all_log_probs).sum(dim=-1).mean()
-            
-            # ListMLE (Ranking)
-            if self.rank_coef > 0:
-                rank_loss = compute_listmle_loss_vectorized(logits, rewards, mask)
-            else:
-                rank_loss = torch.tensor(0.0, device=self.device)
-
-            # Total Loss
-            loss = pg_loss + self.rank_coef * rank_loss - self.entropy_coef * entropy + self.kl_coef * kl_div
-
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"[Warning] NaN/Inf loss at step {step}, skipping")
-                continue
-
-            self.optimizer.zero_grad()
-            loss.backward()
-            if self.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-            self.optimizer.step()
-            self.global_step += 1
-
-            # Stats
-            rank_correlation = compute_rank_correlation(logits, rewards, mask)
-
-            total_loss += loss.item()
-            total_pg_loss += pg_loss.item()
-            total_rank_loss += rank_loss.item()
-            total_entropy += entropy.item()
-            total_kl += kl_div.item()
             total_return += avg_return_value
-            total_rank_corr += rank_correlation.mean().item()
-            total_steps += 1
+            total_rank_corr += rank_corr_value
 
-            # Log step-level metrics to wandb/tensorboard
-            step_metrics = {
-                "loss": loss.item(),
-                "pg_loss": pg_loss.item(),
-                "rank_loss": rank_loss.item(),
-                "entropy": entropy.item(),
-                "kl": kl_div.item(),
-                "avg_return": avg_return_value,
-                "rank_corr": rank_correlation.mean().item(),
-                "ratio_mean": ratio.mean().item(),
-                "ratio_std": ratio.std().item(),
-                "advantage_mean": advantages.mean().item(),
-                "advantage_std": advantages.std().item(),
-                "lr": self.optimizer.param_groups[0]["lr"],
-                "epoch": epoch,
-                "epoch_step": step,
-            }
-            self.logger.log_metrics("train_step", step_metrics, step=self.global_step)
+            for ppo_epoch in range(self.ppo_epochs):
+                logits, _ = self.model(features, mask)
+                masked_logits = logits.masked_fill(~mask, -1e9)
+                all_log_probs = F.log_softmax(masked_logits / self.temperature, dim=-1)
+                all_log_probs_exp = all_log_probs.unsqueeze(1).expand(-1, self.group_size, -1)
+                new_log_probs = (all_log_probs_exp * sampled_mask_float).sum(dim=-1)
 
-            # Update tqdm progress bar
-            pbar.set_postfix(
-                loss=f"{loss.item():.4f}",
-                rank_corr=f"{rank_correlation.mean().item():.4f}",
-                ret=f"{avg_return_value:.5f}"
-            )
+                ratio = torch.exp(new_log_probs - old_log_probs)
+                surr1 = ratio * advantages
+                surr2 = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * advantages
+                pg_loss = -torch.min(surr1, surr2).mean()
 
-        n = max(total_steps, 1)
+                kl_div = (old_log_probs - new_log_probs).mean()
+                probs = all_log_probs.exp()
+                entropy = -(probs * all_log_probs).sum(dim=-1).mean()
+
+                rank_loss = None
+                if self.rank_coef > 0:
+                    rank_loss = compute_listmle_loss_vectorized(logits, rewards, mask)
+
+                loss = pg_loss - self.entropy_coef * entropy + self.kl_coef * kl_div
+                if rank_loss is not None:
+                    loss = loss + self.rank_coef * rank_loss
+
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"[Warning] NaN/Inf loss at step {step} (ppo_iter {ppo_epoch}), skipping")
+                    continue
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                if self.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                self.optimizer.step()
+                self.global_step += 1
+
+                total_loss += loss.item()
+                total_pg_loss += pg_loss.item()
+                total_entropy += entropy.item()
+                total_kl += kl_div.item()
+                if rank_loss is not None:
+                    total_rank_loss += rank_loss.item()
+                total_updates += 1
+
+                if ppo_epoch == self.ppo_epochs - 1:
+                    rank_loss_value = rank_loss.item() if rank_loss is not None else 0.0
+                    ratio_mean = ratio.mean().item()
+                    ratio_std = ratio.std(unbiased=False).item()
+                    step_metrics = {
+                        "loss": loss.item(),
+                        "pg_loss": pg_loss.item(),
+                        "rank_loss": rank_loss_value,
+                        "entropy": entropy.item(),
+                        "kl": kl_div.item(),
+                        "avg_return": avg_return_value,
+                        "rank_corr": rank_corr_value,
+                        "ratio_mean": ratio_mean,
+                        "ratio_std": ratio_std,
+                        "advantage_mean": adv_mean_value,
+                        "advantage_std": adv_std_value,
+                        "lr": self.optimizer.param_groups[0]["lr"],
+                        "epoch": epoch,
+                        "epoch_step": step,
+                        "train_top_k": self.current_train_k,
+                    }
+                    self.logger.log_metrics("train_step", step_metrics, step=self.global_step)
+                    pbar.set_postfix(
+                        loss=f"{loss.item():.4f}",
+                        rank_corr=f"{rank_corr_value:.4f}",
+                        ret=f"{avg_return_value:.5f}",
+                    )
+
+        n_updates = max(total_updates, 1)
+        n_batches = max(batch_count, 1)
+        avg_rank_loss = total_rank_loss / n_updates if self.rank_coef > 0 else 0.0
         return {
-            "loss": total_loss / n,
-            "pg_loss": total_pg_loss / n,
-            "rank_loss": total_rank_loss / n,
-            "entropy": total_entropy / n,
-            "kl": total_kl / n,
-            "avg_return": total_return / n,
-            "rank_corr": total_rank_corr / n,
+            "loss": total_loss / n_updates,
+            "pg_loss": total_pg_loss / n_updates,
+            "rank_loss": avg_rank_loss,
+            "entropy": total_entropy / n_updates,
+            "kl": total_kl / n_updates,
+            "avg_return": total_return / n_batches,
+            "rank_corr": total_rank_corr / n_batches,
         }
 
     def evaluate(self, dataset: DailyBatchDataset, stage: str, epoch: int) -> Tuple[pd.DataFrame, Dict[str, float]]:
