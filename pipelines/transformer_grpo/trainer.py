@@ -188,6 +188,7 @@ class Trainer:
         self.early_stop_patience = int(self.train_cfg.get("early_stop_patience", 20))
         self.log_interval = int(self.train_cfg.get("log_interval", 50))
         self.pretrain_epochs = int(self.train_cfg.get("pretrain_epochs", 5))
+        self.continue_rl = bool(self.train_cfg.get("continue_rl_after_pretrain", True))
         default_pretrain_scale = 100.0 if self.reward_scale == 1.0 else 1.0
         self.pretrain_value_scale = float(self.train_cfg.get("pretrain_value_scale", default_pretrain_scale))
 
@@ -230,6 +231,12 @@ class Trainer:
         # 预训练
         if self.pretrain_epochs > 0:
             self._pretrain_policy()
+            self._save_checkpoint("pretrain.pt", 0)
+
+        if self.pretrain_epochs > 0 and not self.continue_rl:
+            print("[Trainer] RL training skipped per configuration `continue_rl_after_pretrain=False`.")
+            self.logger.close()
+            return
 
     def _resolve_device(self, requested: str) -> torch.device:
         if requested == "cpu":
@@ -417,7 +424,7 @@ class Trainer:
             steps = 0
             warn_flag = False
 
-            for batch in tqdm(loader, desc=f"[Pretrain] Epoch {epoch}"):
+            for step, batch in enumerate(tqdm(loader, desc=f"[Pretrain] Epoch {epoch}"), start=1):
                 features, rewards_norm, rewards_raw, mask = self._move_batch_to_device(batch)
 
                 logits, _ = self.model(features, mask)
@@ -462,6 +469,19 @@ class Trainer:
                 steps += 1
                 if rank_corr.item() < -0.05:
                     warn_flag = True
+
+                step_metrics = {
+                    "epoch": epoch,
+                    "step": step,
+                    "loss": loss.item(),
+                    "listmle_loss": listmle_loss.item(),
+                    "mse_norm": mse_norm.item(),
+                    "mse_raw": mse_raw.item(),
+                    "rank_corr": rank_corr.item(),
+                    "entropy": entropy.item(),
+                    "avg_topk_raw_return": avg_topk.item(),
+                }
+                self.logger.log_metrics("pretrain_step", step_metrics, step=step + (epoch - 1) * len(loader))
 
             avg_loss = total_loss / max(steps, 1)
             avg_rank_corr = total_rank_corr / max(steps, 1)

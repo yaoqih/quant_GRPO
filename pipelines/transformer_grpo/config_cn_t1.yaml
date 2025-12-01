@@ -87,6 +87,7 @@ training:
   grad_clip: 1.0
   early_stop_patience: 20
   pretrain_epochs: 3
+  continue_rl_after_pretrain: true
   checkpoint_root: runs/transformer_grpo
   log_interval: 50
   use_cosine_lr: true

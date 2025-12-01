@@ -15,7 +15,7 @@
    ```
 3. 启动训练（默认使用 `pipelines/transformer_grpo/config_cn_t1.yaml`）
    ```bash
-   python -m pipelines.transformer_grpo.trainer      --config pipelines/transformer_grpo/config_cn_t1.yaml
+   q
    ```
    - 训练日志、指标与模型 `state_dict` 将保存到 `runs/transformer_grpo/<timestamp>/`。
 4. 使用已保存的 checkpoint 回测指定时间段（可选 top-k、多仓/持仓阈值等）
