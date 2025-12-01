@@ -116,6 +116,9 @@ class PrefetchDataLoader:
             next_batch = _next_prefetched()
             yield current
 
+    def __len__(self) -> int:
+        return len(self.loader)
+
 
 class LengthAwareBatchSampler(Sampler[List[int]]):
     """Groups samples with similar instrument counts to reduce padding overhead."""

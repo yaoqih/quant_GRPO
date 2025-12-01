@@ -60,6 +60,11 @@ class WandbLogger(BaseLogger):
     def log_metrics(self, stage: str, metrics: Mapping[str, float], step: Optional[int] = None) -> None:
         if not metrics:
             return
+        if self._run is None:
+            raise RuntimeError(
+                "wandb logger is enabled but wandb.init() did not return a run. "
+                "Please ensure `wandb.login()` completes successfully before training."
+            )
         payload = {f"{stage}/{key}": value for key, value in metrics.items()}
         if step is not None:
             payload["global_step"] = step
@@ -70,14 +75,14 @@ class WandbLogger(BaseLogger):
                 self._last_step = log_step
         else:
             log_step = None
-        self._wandb.log(payload, step=log_step)
+        self._run.log(payload, step=log_step)
 
     def log_trades(self, stage: str, trades_path: Path) -> None:
-        if not self._log_trades or not trades_path.exists():
+        if self._run is None or not self._log_trades or not trades_path.exists():
             return
         artifact = self._wandb.Artifact(name=f"{stage}_trades", type="trades")
         artifact.add_file(str(trades_path))
-        self._wandb.log_artifact(artifact)
+        self._run.log_artifact(artifact)
 
     def close(self) -> None:
         if self._run is not None:
