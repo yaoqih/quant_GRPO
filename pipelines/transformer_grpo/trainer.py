@@ -6,7 +6,7 @@ import gc
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -19,7 +19,7 @@ from tqdm import tqdm
 
 from .backtest import run_backtest, save_trades
 from .data_pipeline import DailyBatchDataset, DailyBatchFactory
-from .logger import LoggerFactory
+from .logger import LoggerFactory, BaseLogger
 from .model import TransformerPolicy
 from .utils import (
     PrefetchDataLoader,
@@ -165,8 +165,10 @@ class Trainer:
         self.work_dir = ensure_dir(self.output_root / self.timestamp)
         self.history_file = self.work_dir / "metrics.jsonl"
 
-        logger_cfg = self.train_cfg.get("logger") or {}
-        self.logger = LoggerFactory(logger_cfg, config, self.work_dir).build()
+        self.logger_cfg = self.train_cfg.get("logger") or {}
+        self.logger_split_runs = bool(self.logger_cfg.get("split_pretrain_run", False))
+        pretrain_suffix = "pretrain" if self.logger_split_runs and self.pretrain_epochs > 0 else None
+        self.logger = self._build_logger(pretrain_suffix)
 
         set_global_seed(int(self.train_cfg.get("seed", 42)))
 
@@ -232,6 +234,9 @@ class Trainer:
         if self.pretrain_epochs > 0:
             self._pretrain_policy()
             self._save_checkpoint("pretrain.pt", 0)
+            if self.logger_split_runs and self.continue_rl:
+                self.logger.close()
+                self.logger = self._build_logger("rl")
 
         if self.pretrain_epochs > 0 and not self.continue_rl:
             print("[Trainer] RL training skipped per configuration `continue_rl_after_pretrain=False`.")
@@ -244,6 +249,18 @@ class Trainer:
         if torch.cuda.is_available() and requested in ("auto", "cuda", "gpu"):
             return torch.device("cuda")
         return torch.device("cpu")
+
+    def _build_logger(self, run_suffix: Optional[str] = None) -> BaseLogger:
+        if not self.logger_cfg:
+            return LoggerFactory({}, self.config, self.work_dir).build()
+        cfg = dict(self.logger_cfg)
+        if run_suffix and (cfg.get("type") or "").lower() == "wandb":
+            base_name = cfg.get("run_name")
+            if base_name:
+                cfg["run_name"] = f"{base_name}-{run_suffix}"
+            else:
+                cfg["run_name"] = run_suffix
+        return LoggerFactory(cfg, self.config, self.work_dir).build()
 
     def _rank_coef_for_epoch(self, epoch: int) -> float:
         if self.rank_coef_start == self.rank_coef_final:
