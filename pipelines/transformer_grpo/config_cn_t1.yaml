@@ -38,7 +38,7 @@ data:
   max_instruments: 3000
   reward:
     clip: [-4.0, 4.0]
-    scale: 1.0
+    scale: 50.0
     normalize:
       type: zscore
       eps: 1.0e-06
@@ -72,13 +72,18 @@ training:
   batch_size: 4
   learning_rate: 0.0005
   weight_decay: 0.01
-  entropy_coef: 0.001
+  entropy_coef: 0.0001
   rank_coef: 0.05
   rank_coef_final: 0.0
   rank_coef_decay_epochs: 10
-  group_size: 4
+  group_size: 2
   clip_ratio: 0.2
   kl_coef: 0.003
+  target_kl: 0.02
+  kl_adjust_rate: 1.5
+  min_kl_coef: 1.0e-05
+  max_kl_coef: 0.05
+  turnover_cost: 0.001
   grad_clip: 1.0
   early_stop_patience: 20
   pretrain_epochs: 3
@@ -86,8 +91,8 @@ training:
   log_interval: 50
   use_cosine_lr: true
   temperature: 0.7
-  train_top_k: 12      # 初始 K (Start)
-  min_train_top_k: 6   # 最终 K (End)
+  train_top_k: 6      # 初始 K (Start)
+  min_train_top_k: 4   # 最终 K (End)
   k_decay_strategy: "linear" # linear, cosine, step
   ppo_epochs: 4
 
@@ -108,6 +113,6 @@ backtest:
   segment: test
   commission: 0.0
   slippage: 0.0
-  top_k: 1
+  top_k: 4
   min_weight: 0.02
   temperature: 0.5

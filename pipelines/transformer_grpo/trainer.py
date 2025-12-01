@@ -90,8 +90,8 @@ def compute_listmle_loss_vectorized(logits: torch.Tensor, rewards: torch.Tensor,
     # 每个batch的loss是有效位置的平均
     n_valid = mask.sum(dim=1).clamp(min=1).float()
     batch_loss = loss_per_pos.sum(dim=1) / n_valid
-
-    return batch_loss.mean()
+    avg_tokens = n_valid.mean().clamp(min=1.0)
+    return batch_loss.mean() / avg_tokens
 
 import math
 
@@ -195,6 +195,11 @@ class Trainer:
         self.ppo_epochs = max(1, int(self.train_cfg.get("ppo_epochs", 1)))
         self.clip_ratio = float(self.train_cfg.get("clip_ratio", 0.2))
         self.kl_coef = float(self.train_cfg.get("kl_coef", 0.0))
+        self.target_kl = float(self.train_cfg.get("target_kl", 0.02))
+        self.kl_adjust_rate = float(self.train_cfg.get("kl_adjust_rate", 1.5))
+        self.min_kl_coef = float(self.train_cfg.get("min_kl_coef", 1e-5))
+        self.max_kl_coef = float(self.train_cfg.get("max_kl_coef", 0.05))
+        self.turnover_cost = float(self.train_cfg.get("turnover_cost", 0.0))
 
         # Top-k参数
         # --- Top-K Scheduler Params ---
@@ -238,6 +243,16 @@ class Trainer:
         span = max(self.rank_coef_decay_epochs - 1, 1)
         progress = min(max((epoch - 1) / span, 0.0), 1.0)
         return self.rank_coef_start + (self.rank_coef_final - self.rank_coef_start) * progress
+
+    def _adjust_kl_coef(self, avg_kl: float) -> None:
+        if avg_kl <= 0:
+            return
+        high_thr = self.target_kl * 1.5
+        low_thr = self.target_kl / 1.5 if self.target_kl > 0 else 0.0
+        if avg_kl > high_thr:
+            self.kl_coef = min(self.kl_coef * self.kl_adjust_rate, self.max_kl_coef)
+        elif low_thr > 0 and avg_kl < low_thr:
+            self.kl_coef = max(self.kl_coef / self.kl_adjust_rate, self.min_kl_coef)
 
     def _build_datasets(self):
         """构建数据集，顺序处理以减少内存峰值。"""
@@ -346,13 +361,14 @@ class Trainer:
         self._loader_prefetches_device = async_transfer
         return loader
 
-    def _move_batch_to_device(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _move_batch_to_device(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._loader_prefetches_device:
-            return batch["features"], batch["rewards"], batch["mask"]
+            return batch["features"], batch["rewards"], batch["raw_rewards"], batch["mask"]
         non_blocking = self.device.type == "cuda" and self._loader_pin_memory
         return (
             batch["features"].to(self.device, non_blocking=non_blocking),
             batch["rewards"].to(self.device, non_blocking=non_blocking),
+            batch["raw_rewards"].to(self.device, non_blocking=non_blocking),
             batch["mask"].to(self.device, non_blocking=non_blocking),
         )
 
@@ -367,25 +383,32 @@ class Trainer:
             self.model.train()
             total_loss = 0.0
             total_rank_corr = 0.0
+            total_topk_return = 0.0
+            total_entropy = 0.0
             steps = 0
+            warn_flag = False
 
             for batch in tqdm(loader, desc=f"[Pretrain] Epoch {epoch}"):
-                features, rewards, mask = self._move_batch_to_device(batch)
+                features, rewards_norm, rewards_raw, mask = self._move_batch_to_device(batch)
 
                 logits, _ = self.model(features, mask)
 
                 # 1. ListMLE Loss (Ranking)
-                listmle_loss = compute_listmle_loss_vectorized(logits, rewards, mask)
+                listmle_loss = compute_listmle_loss_vectorized(logits, rewards_norm, mask)
                 
-                # 2. MSE Loss (Value stability)
+                # 2. MSE Loss (Value stability on normed labels)
                 masked_logits = logits[mask]
-                masked_rewards = rewards[mask]
-                target_rewards = masked_rewards * self.pretrain_value_scale
-                mse = mse_loss_fn(masked_logits, target_rewards)
+                masked_norm_rewards = rewards_norm[mask]
+                target_rewards = masked_norm_rewards * self.pretrain_value_scale
+                mse_norm = mse_loss_fn(masked_logits, target_rewards)
+
+                # 3. Raw reward regression (anchors RL objective)
+                masked_raw_rewards = rewards_raw[mask]
+                mse_raw = mse_loss_fn(masked_logits, masked_raw_rewards)
+
+                loss = listmle_loss + 0.1 * mse_norm + 0.01 * mse_raw
                 
-                loss = listmle_loss + 0.1 * mse
-                
-                rank_corr = compute_rank_correlation(logits, rewards, mask).mean()
+                rank_corr = compute_rank_correlation(logits, rewards_norm, mask).mean()
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -393,15 +416,64 @@ class Trainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
                 self.optimizer.step()
 
+                # Diagnostics: entropy and top-k raw return
+                masked_logits = logits.masked_fill(~mask, -1e9)
+                probs = F.softmax(masked_logits, dim=-1)
+                entropy = -(probs * F.log_softmax(masked_logits, dim=-1)).sum(dim=-1).mean()
+                weights = compute_topk_weights(
+                    logits=logits.detach(), mask=mask, top_k=self.start_top_k,
+                    temperature=self.temperature, min_weight=0.0, differentiable=True,
+                )
+                avg_topk = (weights * rewards_raw).sum(dim=-1).mean()
+
                 total_loss += loss.item()
                 total_rank_corr += rank_corr.item()
+                total_topk_return += avg_topk.item()
+                total_entropy += entropy.item()
                 steps += 1
+                if rank_corr.item() < -0.05:
+                    warn_flag = True
 
             avg_loss = total_loss / max(steps, 1)
             avg_rank_corr = total_rank_corr / max(steps, 1)
-            print(f"[Pretrain {epoch}] loss={avg_loss:.4f} rank_corr={avg_rank_corr:.4f}")
+            avg_topk_return = total_topk_return / max(steps, 1)
+            avg_entropy = total_entropy / max(steps, 1)
+            metrics = {
+                "epoch": epoch,
+                "loss": avg_loss,
+                "rank_corr": avg_rank_corr,
+                "avg_topk_raw_return": avg_topk_return,
+                "entropy": avg_entropy,
+            }
+            self.logger.log_metrics("pretrain_epoch", metrics)
+            print(f"[Pretrain {epoch}] loss={avg_loss:.4f} rank_corr={avg_rank_corr:.4f} "
+                  f"topk_ret={avg_topk_return:.5f} entropy={avg_entropy:.3f}")
+            if warn_flag:
+                print(f"[Pretrain {epoch}] Warning: rank_corr dropped below -0.05; consider checking labels/features.")
+            if avg_topk_return < 0:
+                print(f"[Pretrain {epoch}] Warning: average top-k raw return is negative ({avg_topk_return:.5f}).")
 
         print("[Pretrain] Completed")
+        # Optional quick sanity backtest on validation segment
+        if len(self.valid_dataset) > 0:
+            print("[Pretrain] Running sanity backtest on validation split...")
+            trades, summary = run_backtest(
+                model=self.model,
+                dataset=self.valid_dataset,
+                device=self.device,
+                top_k=int(self.backtest_cfg.get("top_k", self.start_top_k)),
+                temperature=float(self.backtest_cfg.get("temperature", 1.0)),
+                min_weight=float(self.backtest_cfg.get("min_weight", 0.0)),
+                commission=float(self.backtest_cfg.get("commission", 0.0)),
+                slippage=float(self.backtest_cfg.get("slippage", 0.0)),
+                reward_scale=self.reward_scale,
+            )
+            pretrain_dir = ensure_dir(self.work_dir / "pretrain")
+            save_trades(trades, pretrain_dir / "pretrain_trades.csv")
+            (pretrain_dir / "pretrain_metrics.json").write_text(json.dumps(summary, indent=2))
+            self.logger.log_metrics("pretrain_backtest", summary)
+            print(f"[Pretrain] Sanity backtest sharpe={summary.get('sharpe', 0):.4f}, "
+                  f"cum_return={summary.get('cumulative_return', 0):.4f}")
 
     def train(self):
         """主训练循环"""
@@ -414,6 +486,7 @@ class Trainer:
                 # --- [新增] 更新 Top-K ---
                 self.current_train_k = self.k_scheduler.get_k(epoch)
                 train_stats = self._run_epoch(train_loader, epoch)
+                self._adjust_kl_coef(train_stats.get("kl", 0.0))
                 self.logger.log_metrics("train_epoch", {"epoch": epoch, **train_stats})
 
                 val_stats = {}
@@ -470,13 +543,14 @@ class Trainer:
         total_kl = 0.0
         total_return = 0.0
         total_rank_corr = 0.0
+        total_turnover_penalty = 0.0
         total_updates = 0
         batch_count = 0
 
         rank_coef_value = self._rank_coef_for_epoch(epoch)
         pbar = tqdm(loader, desc=f"[Train] Epoch {epoch}")
         for step, batch in enumerate(pbar, start=1):
-            features, rewards, mask = self._move_batch_to_device(batch)
+            features, rewards_norm, rewards_raw, mask = self._move_batch_to_device(batch)
             batch_count += 1
 
             with torch.no_grad():
@@ -494,27 +568,34 @@ class Trainer:
                 sampled_mask_float = sampled_masks.float()
                 old_log_probs = old_log_probs.detach()
 
-                rewards_expanded = rewards.unsqueeze(1).expand(-1, self.group_size, -1)
-                selected_rewards = (rewards_expanded * sampled_mask_float).sum(dim=-1)
+                raw_rewards_exp = rewards_raw.unsqueeze(1).expand(-1, self.group_size, -1)
+                selected_raw = (raw_rewards_exp * sampled_mask_float).sum(dim=-1)
                 selected_counts = sampled_mask_float.sum(dim=-1).clamp(min=1.0)
-                sample_returns = selected_rewards / selected_counts
+                sqrt_counts = torch.sqrt(selected_counts).clamp(min=1.0)
+                if self.turnover_cost > 0:
+                    turnover_penalty = self.turnover_cost * (selected_counts / max(float(self.current_train_k), 1.0))
+                else:
+                    turnover_penalty = torch.zeros_like(selected_counts)
+                sample_returns = (selected_raw - turnover_penalty) / sqrt_counts
                 avg_batch_return = sample_returns.mean()
 
                 mean_return = sample_returns.mean(dim=1, keepdim=True)
                 std_return = sample_returns.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-3)
                 advantages = (sample_returns - mean_return) / std_return
 
-                rank_corr_value = compute_rank_correlation(logits, rewards, mask).mean().item()
+                rank_corr_value = compute_rank_correlation(logits, rewards_norm, mask).mean().item()
 
             advantages = advantages.detach()
             sampled_mask_float = sampled_mask_float.detach()
             selected_counts = selected_counts.detach()
+            turnover_penalty_value = turnover_penalty.mean().item()
             adv_mean_value = advantages.mean().item()
             adv_std_value = advantages.std(unbiased=False).item()
             avg_return_value = (avg_batch_return / self.reward_scale).item()
 
             total_return += avg_return_value
             total_rank_corr += rank_corr_value
+            total_turnover_penalty += turnover_penalty_value
 
             for ppo_epoch in range(self.ppo_epochs):
                 logits, _ = self.model(features, mask)
@@ -535,7 +616,7 @@ class Trainer:
 
                 rank_loss = None
                 if rank_coef_value > 0:
-                    rank_loss = compute_listmle_loss_vectorized(logits, rewards, mask)
+                    rank_loss = compute_listmle_loss_vectorized(logits, rewards_norm, mask)
 
                 loss = pg_loss - self.entropy_coef * entropy + self.kl_coef * kl_div
                 if rank_loss is not None:
@@ -576,11 +657,13 @@ class Trainer:
                         "ratio_std": ratio_std,
                         "advantage_mean": adv_mean_value,
                         "advantage_std": adv_std_value,
+                        "turnover_penalty": turnover_penalty_value,
                         "lr": self.optimizer.param_groups[0]["lr"],
                         "epoch": epoch,
                         "epoch_step": step,
                         "train_top_k": self.current_train_k,
                         "rank_coef": rank_coef_value,
+                        "kl_coef": self.kl_coef,
                     }
                     self.logger.log_metrics("train_step", step_metrics, step=self.global_step)
                     pbar.set_postfix(
@@ -600,6 +683,7 @@ class Trainer:
             "kl": total_kl / n_updates,
             "avg_return": total_return / n_batches,
             "rank_corr": total_rank_corr / n_batches,
+            "turnover_penalty": total_turnover_penalty / n_batches,
         }
 
     def evaluate(self, dataset: DailyBatchDataset, stage: str, epoch: int) -> Tuple[pd.DataFrame, Dict[str, float]]:
