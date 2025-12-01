@@ -6,12 +6,13 @@ import random
 import threading
 from queue import Queue
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from torch.utils.data import Sampler
 
 from .data_pipeline import DailyBatch
 
@@ -114,6 +115,48 @@ class PrefetchDataLoader:
             current = next_batch
             next_batch = _next_prefetched()
             yield current
+
+
+class LengthAwareBatchSampler(Sampler[List[int]]):
+    """Groups samples with similar instrument counts to reduce padding overhead."""
+
+    def __init__(
+        self,
+        lengths: Sequence[int],
+        batch_size: int,
+        shuffle: bool = True,
+        bucket_size_multiplier: float = 8.0,
+        drop_last: bool = False,
+    ):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        self.lengths: List[int] = list(lengths)
+        self.batch_size = int(batch_size)
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        bucket_size_multiplier = max(float(bucket_size_multiplier), 1.0)
+        self.bucket_size = max(self.batch_size, int(self.batch_size * bucket_size_multiplier))
+        self._indices = list(range(len(self.lengths)))
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return len(self._indices) // self.batch_size
+        return math.ceil(len(self._indices) / max(self.batch_size, 1))
+
+    def __iter__(self):  # type: ignore[override]
+        indices = list(self._indices)
+        if self.shuffle:
+            random.shuffle(indices)
+
+        for start in range(0, len(indices), self.bucket_size):
+            bucket = indices[start : start + self.bucket_size]
+            bucket.sort(key=lambda idx: self.lengths[idx], reverse=True)
+            for chunk_start in range(0, len(bucket), self.batch_size):
+                batch = bucket[chunk_start : chunk_start + self.batch_size]
+                if self.drop_last and len(batch) < self.batch_size:
+                    continue
+                if batch:
+                    yield batch
 
 
 def compute_topk_weights(
@@ -246,7 +289,7 @@ def sample_topk_actions(
 
 
 def collate_daily_batches(samples: List[DailyBatch]) -> Dict[str, object]:
-    """将多个DailyBatch合并为一个batch。"""
+    """将多个DailyBatch合并为一个batch，并保留输入特征的原始精度。"""
     if not samples:
         raise ValueError("Empty batch.")
 
@@ -262,7 +305,10 @@ def collate_daily_batches(samples: List[DailyBatch]) -> Dict[str, object]:
         temporal_span = 1
         feature_dim = first_shape[1]
 
-    features = torch.zeros(batch_size, max_tokens, temporal_span, feature_dim, dtype=torch.float32)
+    np_feat_dtype = np.dtype(getattr(samples[0], "feature_dtype", np.float32))
+    torch_feat_dtype = _numpy_dtype_to_torch(np_feat_dtype)
+
+    features = torch.zeros(batch_size, max_tokens, temporal_span, feature_dim, dtype=torch_feat_dtype)
     rewards = torch.zeros(batch_size, max_tokens, dtype=torch.float32)
     mask = torch.zeros(batch_size, max_tokens, dtype=torch.bool)
     metadata: List[Dict[str, object]] = []
@@ -274,7 +320,11 @@ def collate_daily_batches(samples: List[DailyBatch]) -> Dict[str, object]:
         length = feat.shape[0]
         if feat.ndim == 2:
             feat = feat[:, np.newaxis, :]
-        features[idx, :length] = torch.from_numpy(feat.astype(np.float32, copy=False))
+        feat_np = np.asarray(feat, dtype=np_feat_dtype)
+        feat_tensor = torch.from_numpy(feat_np)
+        if feat_tensor.dtype != torch_feat_dtype:
+            feat_tensor = feat_tensor.to(torch_feat_dtype)
+        features[idx, :length] = feat_tensor
         rewards[idx, :length] = torch.from_numpy(rew.astype(np.float32, copy=False))
         raw_rewards[idx, :length] = torch.from_numpy(raw.astype(np.float32, copy=False))
         mask[idx, :length] = True
@@ -301,6 +351,14 @@ def _infer_sample_shape(sample: DailyBatch) -> Tuple[int, ...]:
         return sample.features.shape
     feat, _, _ = sample.materialize()
     return feat.shape
+
+
+def _numpy_dtype_to_torch(dtype: np.dtype) -> torch.dtype:
+    if dtype == np.float16:
+        return torch.float16
+    if dtype == np.float64:
+        return torch.float64
+    return torch.float32
 
 
 def compute_performance(trades: pd.DataFrame, risk_free: float = 0.02) -> Dict[str, float]:

@@ -28,6 +28,7 @@ from .utils import (
     ensure_dir,
     set_global_seed,
     sample_topk_actions,
+    LengthAwareBatchSampler,
 )
 
 
@@ -328,15 +329,36 @@ class Trainer:
         num_workers = int(loader_cfg.get("num_workers", 0))
         pin_memory_default = self.device.type == "cuda"
         pin_memory = bool(loader_cfg.get("pin_memory", pin_memory_default))
+        drop_last = bool(loader_cfg.get("drop_last", False))
         loader_kwargs = {
             "dataset": dataset,
             "batch_size": self.batch_size,
             "shuffle": shuffle,
             "collate_fn": collate_daily_batches,
             "num_workers": num_workers,
-            "drop_last": False,
+            "drop_last": drop_last,
             "pin_memory": pin_memory,
         }
+
+        bucket_sampler = None
+        bucket_enabled = bool(loader_cfg.get("bucket_by_instrument_count", False))
+        has_lengths = getattr(dataset, "instrument_counts", None)
+        if bucket_enabled and shuffle and has_lengths:
+            bucket_multiplier = float(loader_cfg.get("bucket_size_multiplier", 8.0))
+            bucket_sampler = LengthAwareBatchSampler(
+                lengths=dataset.instrument_counts,
+                batch_size=self.batch_size,
+                shuffle=True,
+                bucket_size_multiplier=bucket_multiplier,
+                drop_last=drop_last,
+            )
+
+        if bucket_sampler is not None:
+            loader_kwargs.pop("batch_size", None)
+            loader_kwargs.pop("shuffle", None)
+            loader_kwargs.pop("drop_last", None)
+            loader_kwargs["batch_sampler"] = bucket_sampler
+
         if num_workers > 0:
             prefetch_factor = loader_cfg.get("prefetch_factor")
             if prefetch_factor is not None:
@@ -363,14 +385,21 @@ class Trainer:
 
     def _move_batch_to_device(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self._loader_prefetches_device:
-            return batch["features"], batch["rewards"], batch["raw_rewards"], batch["mask"]
-        non_blocking = self.device.type == "cuda" and self._loader_pin_memory
-        return (
-            batch["features"].to(self.device, non_blocking=non_blocking),
-            batch["rewards"].to(self.device, non_blocking=non_blocking),
-            batch["raw_rewards"].to(self.device, non_blocking=non_blocking),
-            batch["mask"].to(self.device, non_blocking=non_blocking),
-        )
+            features = batch["features"]
+            rewards = batch["rewards"]
+            raw_rewards = batch["raw_rewards"]
+            mask = batch["mask"]
+        else:
+            non_blocking = self.device.type == "cuda" and self._loader_pin_memory
+            features = batch["features"].to(self.device, non_blocking=non_blocking)
+            rewards = batch["rewards"].to(self.device, non_blocking=non_blocking)
+            raw_rewards = batch["raw_rewards"].to(self.device, non_blocking=non_blocking)
+            mask = batch["mask"].to(self.device, non_blocking=non_blocking)
+
+        if features.dtype != torch.float32:
+            features = features.float()
+
+        return features, rewards, raw_rewards, mask
 
     def _pretrain_policy(self):
         """Pretraining phase: ListMLE + MSE for stability."""

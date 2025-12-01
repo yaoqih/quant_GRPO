@@ -77,6 +77,7 @@ class DailyBatchDataset(Dataset):
             self.feature_dim = 0
             self.temporal_span = 1
         self.max_instruments: int = max((_num_tokens(b) for b in self._batches), default=0)
+        self.instrument_counts: List[int] = [_num_tokens(batch) for batch in self._batches]
 
     def __len__(self) -> int:
         return len(self._batches)
