@@ -7,20 +7,33 @@ import torch
 import torch.nn as nn
 
 
-class GatedFeatureExtractor(nn.Module):
-    """在进入主干网络前抑制冗余特征噪声。"""
+class BottleneckFeatureExtractor(nn.Module):
+    """强力瓶颈特征层，在送入 Transformer 之前压缩并筛选信号。"""
 
-    def __init__(self, feature_dim: int, d_model: int, dropout: float = 0.1):
+    def __init__(self, feature_dim: int, d_model: int, expansion: int = 4, dropout: float = 0.1):
         super().__init__()
-        self.linear_val = nn.Linear(feature_dim, d_model)
-        self.linear_gate = nn.Linear(feature_dim, d_model)
+        hidden_dim = max(d_model * expansion, d_model)
+        self.core = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+        )
+        self.shortcut = nn.Linear(feature_dim, d_model)
+        self.gate = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+            nn.Sigmoid(),
+        )
         self.dropout = nn.Dropout(dropout)
-        self.sigmoid = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        values = self.linear_val(x)
-        gate = self.sigmoid(self.linear_gate(x))
-        return self.dropout(values * gate)
+        transformed = self.core(x)
+        residual = self.shortcut(x)
+        gate = self.gate(x)
+        return self.dropout((transformed + residual) * gate)
 
 
 class GRUTemporalEncoder(nn.Module):
@@ -63,7 +76,7 @@ class TransformerPolicy(nn.Module):
         self,
         feature_dim: int,
         d_model: int = 128,
-        nhead: int = 4,
+        nhead: int = 2,
         num_layers: int = 2,
         dropout: float = 0.1,
         ff_multiplier: int = 4,
@@ -78,7 +91,7 @@ class TransformerPolicy(nn.Module):
         
         # Feature normalization on the last dimension only (insensitive to padding)
         self.feature_norm = nn.LayerNorm(feature_dim)
-        self.feature_gating = GatedFeatureExtractor(feature_dim, d_model, dropout=dropout)
+        self.feature_extractor = BottleneckFeatureExtractor(feature_dim, d_model, dropout=dropout)
 
         # 20日以内短序列用GRU更稳定
         self.temporal_encoder = GRUTemporalEncoder(
@@ -119,14 +132,14 @@ class TransformerPolicy(nn.Module):
             batch, instruments, timesteps, _ = features.shape
 
             normed_features = self.feature_norm(features)
-            gated = self.feature_gating(normed_features)
+            gated = self.feature_extractor(normed_features)
             temporal_input = gated.reshape(batch * instruments, timesteps, self.d_model)
             temporal_out = self.temporal_encoder(temporal_input)
             x = temporal_out.view(batch, instruments, self.d_model)
         else:
             batch, instruments, _ = features.shape
             normed_features = self.feature_norm(features)
-            x = self.feature_gating(normed_features)
+            x = self.feature_extractor(normed_features)
 
         x = self.layer_norm(x)
 

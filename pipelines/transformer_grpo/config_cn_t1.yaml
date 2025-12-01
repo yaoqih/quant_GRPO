@@ -10,9 +10,9 @@ data:
     module_path: qlib.contrib.data.handler
     kwargs:
       instruments: all
-      start_time: 2010-01-01
+      start_time: 2018-01-01
       end_time: 2025-01-01
-      fit_start_time: 2010-01-01
+      fit_start_time: 2018-01-01
       fit_end_time: 2025-12-31
       freq: day
       infer_processors:
@@ -26,9 +26,9 @@ data:
       learn_processors:
         - class: DropnaLabel
       label:
-        - "Ref($close, -1) / Ref($open, -1) - 1"
+        - "Ref($open, -2) / Ref($open, -1) - 1"
   segments:
-    train: ["2010-01-01", "2022-12-31"]
+    train: ["2018-01-01", "2022-12-31"]
     valid: ["2023-01-01", "2023-12-31"]
     test: ["2024-01-01", "2024-12-31"]
   feature_group: feature
@@ -43,7 +43,7 @@ data:
       type: zscore
       eps: 1.0e-06
   augment:
-    temporal_span: 20
+    temporal_span: 8
     include_cash_token: true
     cash_return: 0.0
     cash_token: "CASH"
@@ -57,9 +57,9 @@ data:
       # num_workers removed - using synchronous cache writes for lower memory
 
 model:
-  d_model: 256
-  nhead: 4
-  num_layers: 4
+  d_model: 128
+  nhead: 2
+  num_layers: 2
   dropout: 0.1
   ff_multiplier: 4
   temporal_nhead: 4
@@ -76,7 +76,7 @@ training:
   rank_coef: 0.05
   rank_coef_final: 0.0
   rank_coef_decay_epochs: 10
-  group_size: 2
+  group_size: 8
   clip_ratio: 0.2
   kl_coef: 0.003
   target_kl: 0.02
@@ -115,6 +115,6 @@ backtest:
   segment: test
   commission: 0.0
   slippage: 0.0
-  top_k: 4
+  top_k: 1
   min_weight: 0.02
   temperature: 0.5

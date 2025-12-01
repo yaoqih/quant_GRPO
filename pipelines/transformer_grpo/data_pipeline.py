@@ -107,6 +107,16 @@ def _num_tokens(batch: DailyBatch) -> int:
     return len(batch.instruments)
 
 
+def _time_embedding(timestamp: pd.Timestamp) -> np.ndarray:
+    """Calendar embedding scaled to [0, 1], repeated later per instrument."""
+    day_of_week = float(timestamp.dayofweek) / 6.0 if timestamp.dayofweek <= 6 else 0.0
+    month_days = max(int(timestamp.days_in_month), 1)
+    day_of_month_norm = float(timestamp.day - 1) / max(month_days - 1, 1)
+    year_days = 366 if timestamp.is_leap_year else 365
+    day_of_year_norm = float(timestamp.dayofyear - 1) / max(year_days - 1, 1)
+    return np.array([day_of_week, day_of_month_norm, day_of_year_norm], dtype=np.float32)
+
+
 class RollingWindowLoader:
     """Build rolling windows directly from in-memory cross sections."""
 
@@ -207,7 +217,8 @@ class DailyBatchFactory:
             self.instrument_universe = None
             self._instrument_universe_array = None
         self.augment_cfg = augment or {}
-        self.temporal_span = max(int(self.augment_cfg.get("temporal_span", 1)), 1)
+        requested_span = max(int(self.augment_cfg.get("temporal_span", 1)), 1)
+        self.temporal_span = requested_span
 
         self.label_expressions = _extract_label_expressions(handler_config)
         self.label_future_lookahead = _infer_label_future_lookahead(self.label_expressions)
@@ -285,6 +296,13 @@ class DailyBatchFactory:
 
                 if day_feats.size == 0:
                     continue
+
+                time_embed = _time_embedding(current_date)
+                time_columns = np.broadcast_to(
+                    time_embed,
+                    (day_feats.shape[0], time_embed.shape[0]),
+                ).astype(day_feats.dtype, copy=False)
+                day_feats = np.concatenate([day_feats, time_columns], axis=1)
 
                 sort_idx = np.argsort(day_instruments)
                 day_instruments = day_instruments[sort_idx]
