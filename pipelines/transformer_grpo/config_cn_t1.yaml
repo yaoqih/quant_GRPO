@@ -37,8 +37,8 @@ data:
   min_instruments: 30
   max_instruments: 3000
   reward:
-    clip: [-4.0, 4.0]
-    scale: 50.0
+    clip: [-2.0, 2.0]
+    scale: 10.0
     normalize:
       type: zscore
       eps: 1.0e-06
@@ -70,8 +70,8 @@ training:
   device: auto
   epochs: 40
   batch_size: 8
-  pretrain_value_scale: 3
-  learning_rate: 0.0001
+  pretrain_value_scale: 10
+  learning_rate: 0.0003
   weight_decay: 0.01
   entropy_coef: 0.001
   rank_coef: 0.05
@@ -86,6 +86,7 @@ training:
   max_kl_coef: 0.05
   turnover_cost: 0.001
   grad_clip: 1.0
+  grad_accum_steps: 4
   early_stop_patience: 20
   pretrain_epochs: 20
   continue_rl_after_pretrain: false
@@ -97,6 +98,11 @@ training:
   min_train_top_k: 4   # 最终 K (End)
   k_decay_strategy: "linear" # linear, cosine, step
   ppo_epochs: 4
+
+  pretrain_loss_weights:
+    listmle: 0.5
+    mse_norm: 0.02
+    mse_raw: 0.005
 
   dataloader:
     num_workers: 16

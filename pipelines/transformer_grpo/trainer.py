@@ -187,11 +187,20 @@ class Trainer:
         self.rank_coef_final = float(self.train_cfg.get("rank_coef_final", self.rank_coef_start))
         self.rank_coef_decay_epochs = max(1, int(self.train_cfg.get("rank_coef_decay_epochs", self.epochs)))
         self.grad_clip = float(self.train_cfg.get("grad_clip", 1.0))
+        default_loss_weights = {"listmle": 1.0, "mse_norm": 0.1, "mse_raw": 0.01}
+        cfg_loss_weights = self.train_cfg.get("pretrain_loss_weights") or {}
+        self.pretrain_loss_weights = {
+            "listmle": float(cfg_loss_weights.get("listmle", default_loss_weights["listmle"])),
+            "mse_norm": float(cfg_loss_weights.get("mse_norm", default_loss_weights["mse_norm"])),
+            "mse_raw": float(cfg_loss_weights.get("mse_raw", default_loss_weights["mse_raw"])),
+        }
         self.early_stop_patience = int(self.train_cfg.get("early_stop_patience", 20))
         self.log_interval = int(self.train_cfg.get("log_interval", 50))
         self.pretrain_epochs = int(self.train_cfg.get("pretrain_epochs", 5))
         self.continue_rl = bool(self.train_cfg.get("continue_rl_after_pretrain", True))
         self.skip_rl_training = False
+        self.grad_accum_steps = max(1, int(self.train_cfg.get("grad_accum_steps", 1)))
+        self._grad_accum_counter = 0
         default_pretrain_scale = 100.0 if self.reward_scale == 1.0 else 1.0
         self.pretrain_value_scale = float(self.train_cfg.get("pretrain_value_scale", default_pretrain_scale))
 
@@ -344,6 +353,7 @@ class Trainer:
         self.scheduler = None
         if self.train_cfg.get("use_cosine_lr", True):
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.epochs)
+        self.optimizer.zero_grad(set_to_none=True)
 
     def _save_config(self):
         with (self.work_dir / "config.yaml").open("w", encoding="utf-8") as f:
@@ -426,12 +436,33 @@ class Trainer:
 
         return features, rewards, raw_rewards, mask
 
+    def _backward_with_accum(self, loss: torch.Tensor, count_global_step: bool) -> None:
+        scaled_loss = loss / self.grad_accum_steps
+        scaled_loss.backward()
+        self._grad_accum_counter += 1
+        if self._grad_accum_counter >= self.grad_accum_steps:
+            self._step_optimizer(count_global_step)
+
+    def _step_optimizer(self, count_global_step: bool) -> None:
+        if self.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        self._grad_accum_counter = 0
+        if count_global_step:
+            self.global_step += 1
+
+    def _flush_optimizer(self, count_global_step: bool) -> None:
+        if self._grad_accum_counter > 0:
+            self._step_optimizer(count_global_step)
+
     def _pretrain_policy(self):
         """Pretraining phase: ListMLE + MSE for stability."""
         loader = self._build_loader(self.train_dataset, shuffle=True)
         print(f"[Pretrain] Starting supervised warm-up for {self.pretrain_epochs} epoch(s)")
         
         mse_loss_fn = torch.nn.MSELoss()
+        loss_w = self.pretrain_loss_weights
 
         for epoch in range(1, self.pretrain_epochs + 1):
             self.model.train()
@@ -460,15 +491,15 @@ class Trainer:
                 masked_raw_rewards = rewards_raw[mask]
                 mse_raw = mse_loss_fn(masked_logits, masked_raw_rewards)
 
-                loss = listmle_loss *0.5 + mse_norm*0.05 + mse_raw*0.01
+                loss = (
+                    loss_w["listmle"] * listmle_loss
+                    + loss_w["mse_norm"] * mse_norm
+                    + loss_w["mse_raw"] * mse_raw
+                )
                 
                 rank_corr = compute_rank_correlation(logits, rewards_norm, mask).mean()
 
-                self.optimizer.zero_grad()
-                loss.backward()
-                if self.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                self.optimizer.step()
+                self._backward_with_accum(loss, count_global_step=False)
 
                 # Diagnostics: entropy and top-k raw return
                 masked_logits = logits.masked_fill(~mask, -1e9)
@@ -501,6 +532,7 @@ class Trainer:
                 }
                 self.logger.log_metrics("pretrain_step", step_metrics, step=step + (epoch - 1) * len(loader))
 
+            self._flush_optimizer(count_global_step=False)
             avg_loss = total_loss / max(steps, 1)
             avg_rank_corr = total_rank_corr / max(steps, 1)
             avg_topk_return = total_topk_return / max(steps, 1)
@@ -696,12 +728,7 @@ class Trainer:
                     print(f"[Warning] NaN/Inf loss at step {step} (ppo_iter {ppo_epoch}), skipping")
                     continue
 
-                self.optimizer.zero_grad()
-                loss.backward()
-                if self.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                self.optimizer.step()
-                self.global_step += 1
+                self._backward_with_accum(loss, count_global_step=True)
 
                 total_loss += loss.item()
                 total_pg_loss += pg_loss.item()
@@ -742,6 +769,7 @@ class Trainer:
                         ret=f"{avg_return_value:.5f}",
                     )
 
+        self._flush_optimizer(count_global_step=True)
         n_updates = max(total_updates, 1)
         n_batches = max(batch_count, 1)
         avg_rank_loss = total_rank_loss / n_updates if rank_coef_value > 0 else 0.0
