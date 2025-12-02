@@ -312,6 +312,69 @@ class Trainer:
             return 0.5 * (listmle + ic_loss)
         return compute_ic_loss(logits, rewards, mask)
 
+    def _evaluate_pretrain_dataset(self, dataset: DailyBatchDataset) -> Dict[str, float]:
+        if len(dataset) == 0:
+            return {}
+        prev_prefetch = self._loader_prefetches_device
+        prev_pin = self._loader_pin_memory
+        loader = self._build_loader(dataset, shuffle=False)
+        self.model.eval()
+
+        loss_w = self.pretrain_loss_weights
+        total_loss = 0.0
+        total_listmle = 0.0
+        total_ic = 0.0
+        total_entropy = 0.0
+        total_rank_corr = 0.0
+        total_topk_return = 0.0
+        steps = 0
+
+        with torch.no_grad():
+            for batch in loader:
+                features, rewards_norm, rewards_raw, mask = self._move_batch_to_device(batch)
+                logits, _ = self.model(features, mask)
+                listmle_loss = compute_listmle_loss_vectorized(logits, rewards_norm, mask)
+                ic_loss = compute_ic_loss(logits, rewards_norm, mask)
+
+                masked_logits_full = logits.masked_fill(~mask, -1e9)
+                probs = F.softmax(masked_logits_full, dim=-1)
+                entropy = -(probs * F.log_softmax(masked_logits_full, dim=-1)).sum(dim=-1).mean()
+
+                listmle_term = loss_w["listmle"] * listmle_loss
+                ic_term = loss_w["ic"] * ic_loss
+                l1_penalty = self.model.feature_l1_penalty() if self.feature_l1_coef > 0 else logits.new_zeros(())
+                loss = listmle_term + ic_term - self.pretrain_entropy_coef * entropy + self.feature_l1_coef * l1_penalty
+
+                weights = compute_topk_weights(
+                    logits=logits, mask=mask, top_k=self.start_top_k,
+                    temperature=self.temperature, min_weight=0.0, differentiable=True,
+                )
+                avg_topk = (weights * rewards_raw).sum(dim=-1).mean()
+                rank_corr = compute_rank_correlation(logits, rewards_norm, mask).mean()
+
+                total_loss += loss.item()
+                total_listmle += listmle_loss.item()
+                total_ic += ic_loss.item()
+                total_entropy += entropy.item()
+                total_rank_corr += rank_corr.item()
+                total_topk_return += avg_topk.item()
+                steps += 1
+
+        avg_loss = total_loss / max(steps, 1)
+        metrics = {
+            "loss": avg_loss,
+            "listmle_loss": total_listmle / max(steps, 1),
+            "ic_loss": total_ic / max(steps, 1),
+            "entropy": total_entropy / max(steps, 1),
+            "rank_corr": total_rank_corr / max(steps, 1),
+            "avg_topk_raw_return": total_topk_return / max(steps, 1),
+        }
+
+        self.model.train()
+        self._loader_prefetches_device = prev_prefetch
+        self._loader_pin_memory = prev_pin
+        return metrics
+
     def _build_datasets(self):
         """构建数据集，顺序处理以减少内存峰值。"""
         handler_cfg = self.data_cfg.get("handler")
@@ -572,6 +635,22 @@ class Trainer:
                 print(f"[Pretrain {epoch}] Warning: rank_corr dropped below -0.05; consider checking labels/features.")
             if avg_topk_return < 0:
                 print(f"[Pretrain {epoch}] Warning: average top-k raw return is negative ({avg_topk_return:.5f}).")
+
+            if len(self.valid_dataset) > 0:
+                val_metrics = self._evaluate_pretrain_dataset(self.valid_dataset)
+                if val_metrics:
+                    val_metrics_with_epoch = {"epoch": epoch, **val_metrics}
+                    self.logger.log_metrics("pretrain_valid_epoch", val_metrics_with_epoch)
+                    loss_gap = val_metrics["loss"] - avg_loss
+                    overfit_ratio = val_metrics["loss"] / max(avg_loss, 1e-8)
+                    self.logger.log_metrics(
+                        "pretrain_overfit",
+                        {"epoch": epoch, "loss_gap": loss_gap, "loss_ratio": overfit_ratio},
+                    )
+                    print(
+                        f"[Pretrain {epoch}] valid_loss={val_metrics['loss']:.4f} "
+                        f"gap={loss_gap:.4f} ratio={overfit_ratio:.3f}"
+                    )
 
         print("[Pretrain] Completed")
         # Optional quick sanity backtest on validation segment
