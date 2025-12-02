@@ -69,8 +69,8 @@ training:
   seed: 42
   device: auto
   epochs: 40
-  batch_size: 8
-  pretrain_value_scale: 2
+  batch_size: 16
+  pretrain_value_scale: 1
   learning_rate: 0.0003
   weight_decay: 0.01
   entropy_coef: 0.001
@@ -86,24 +86,25 @@ training:
   max_kl_coef: 0.05
   turnover_cost: 0.001
   grad_clip: 1.0
-  grad_accum_steps: 4
+  grad_accum_steps: 8
   early_stop_patience: 20
   pretrain_epochs: 20
   continue_rl_after_pretrain: false
   checkpoint_root: runs/transformer_grpo
   log_interval: 50
   use_cosine_lr: false
-  temperature: 1.5
+  temperature: 1.0
   train_top_k: 6      # 初始 K (Start)
   min_train_top_k: 4   # 最终 K (End)
   k_decay_strategy: "linear" # linear, cosine, step
   ppo_epochs: 4
 
   pretrain_loss_weights:
-    listmle: 1.0
-    mse_norm: 0.01
-    mse_raw: 0.01
-  pretrain_entropy_coef: 0.001
+    listmle: 1.2
+    mse_norm: 0.005
+    mse_raw: 0.002
+  pretrain_entropy_coef: 0.003
+  pretrain_listmle_warmup_steps: 1000
 
   dataloader:
     num_workers: 16

@@ -187,7 +187,7 @@ class Trainer:
         self.rank_coef_final = float(self.train_cfg.get("rank_coef_final", self.rank_coef_start))
         self.rank_coef_decay_epochs = max(1, int(self.train_cfg.get("rank_coef_decay_epochs", self.epochs)))
         self.grad_clip = float(self.train_cfg.get("grad_clip", 1.0))
-        default_loss_weights = {"listmle": 1.0, "mse_norm": 0.01, "mse_raw": 0.01}
+        default_loss_weights = {"listmle": 1.0, "mse_norm": 0.005, "mse_raw": 0.002}
         cfg_loss_weights = self.train_cfg.get("pretrain_loss_weights") or {}
         self.pretrain_loss_weights = {
             "listmle": float(cfg_loss_weights.get("listmle", default_loss_weights["listmle"])),
@@ -195,6 +195,7 @@ class Trainer:
             "mse_raw": float(cfg_loss_weights.get("mse_raw", default_loss_weights["mse_raw"])),
         }
         self.pretrain_entropy_coef = float(self.train_cfg.get("pretrain_entropy_coef", 0.0))
+        self.pretrain_listmle_warmup_steps = max(0, int(self.train_cfg.get("pretrain_listmle_warmup_steps", 0)))
         self.early_stop_patience = int(self.train_cfg.get("early_stop_patience", 20))
         self.log_interval = int(self.train_cfg.get("log_interval", 50))
         self.pretrain_epochs = int(self.train_cfg.get("pretrain_epochs", 5))
@@ -464,6 +465,7 @@ class Trainer:
         
         mse_loss_fn = torch.nn.MSELoss()
         loss_w = self.pretrain_loss_weights
+        pretrain_global_step = 0
 
         for epoch in range(1, self.pretrain_epochs + 1):
             self.model.train()
@@ -496,10 +498,14 @@ class Trainer:
                 probs = F.softmax(masked_logits_full, dim=-1)
                 entropy = -(probs * F.log_softmax(masked_logits_full, dim=-1)).sum(dim=-1).mean()
 
+                warmup_scale = 1.0
+                if self.pretrain_listmle_warmup_steps > 0:
+                    warmup_scale = min(pretrain_global_step / self.pretrain_listmle_warmup_steps, 1.0)
+
                 loss = (
                     loss_w["listmle"] * listmle_loss
-                    + loss_w["mse_norm"] * mse_norm
-                    + loss_w["mse_raw"] * mse_raw
+                    + (loss_w["mse_norm"] * warmup_scale) * mse_norm
+                    + (loss_w["mse_raw"] * warmup_scale) * mse_raw
                     - self.pretrain_entropy_coef * entropy
                 )
                 
@@ -533,8 +539,10 @@ class Trainer:
                     "rank_corr": rank_corr.item(),
                     "entropy": entropy_value,
                     "avg_topk_raw_return": avg_topk.item(),
+                    "warmup_scale": warmup_scale,
                 }
-                self.logger.log_metrics("pretrain_step", step_metrics, step=step + (epoch - 1) * len(loader))
+                self.logger.log_metrics("pretrain_step", step_metrics, step=pretrain_global_step)
+                pretrain_global_step += 1
 
             self._flush_optimizer(count_global_step=False)
             avg_loss = total_loss / max(steps, 1)
