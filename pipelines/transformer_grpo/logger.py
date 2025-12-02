@@ -55,7 +55,7 @@ class WandbLogger(BaseLogger):
         self._wandb = wandb
         self._run = wandb.init(**init_kwargs)
         self._log_trades = bool(cfg.get("log_trades", False))
-        self._last_step: Optional[int] = None
+        self._last_step: int = -1
 
     def log_metrics(self, stage: str, metrics: Mapping[str, float], step: Optional[int] = None) -> None:
         if not metrics:
@@ -66,15 +66,13 @@ class WandbLogger(BaseLogger):
                 "Please ensure `wandb.login()` completes successfully before training."
             )
         payload = {f"{stage}/{key}": value for key, value in metrics.items()}
+        prev_step = self._last_step
         if step is not None:
             payload["global_step"] = step
-            log_step = step
-            if self._last_step is not None and log_step <= self._last_step:
-                log_step = None
-            else:
-                self._last_step = log_step
+            log_step = step if step > prev_step else prev_step + 1
         else:
-            log_step = None
+            log_step = prev_step + 1
+        self._last_step = log_step
         self._run.log(payload, step=log_step)
 
     def log_trades(self, stage: str, trades_path: Path) -> None:
