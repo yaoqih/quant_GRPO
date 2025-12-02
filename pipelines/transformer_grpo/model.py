@@ -111,7 +111,7 @@ class TransformerPolicy(nn.Module):
 
         # 输出头
         self.policy_head = nn.Linear(d_model, 1)
-        self.logit_scale = nn.Parameter(torch.ones(1))
+        self.logit_scale = nn.Parameter(torch.zeros(1))
         self._init_weights()
     def _init_weights(self):
         """Xavier 初始化，有助于模型快速收敛"""
@@ -165,5 +165,5 @@ class TransformerPolicy(nn.Module):
 
         stock_embeddings = encoded[:, 1:, :]
         logits = self.policy_head(stock_embeddings).squeeze(-1)
-        logits = logits * self.logit_scale
+        logits = logits * torch.exp(self.logit_scale)
         return logits, None

@@ -69,7 +69,7 @@ training:
   seed: 42
   device: auto
   epochs: 40
-  batch_size: 16
+  batch_size: 24
   pretrain_value_scale: 1
   learning_rate: 0.0003
   weight_decay: 0.01
@@ -100,11 +100,11 @@ training:
   ppo_epochs: 4
 
   pretrain_loss_weights:
-    listmle: 1.2
-    mse_norm: 0.005
-    mse_raw: 0.002
+    listmle: 1.5
+    mse_norm: 0.003
+    mse_raw: 0.0015
   pretrain_entropy_coef: 0.003
-  pretrain_listmle_warmup_steps: 1000
+  pretrain_listmle_warmup_steps: 2000
 
   dataloader:
     num_workers: 16
