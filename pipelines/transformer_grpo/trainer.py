@@ -187,13 +187,14 @@ class Trainer:
         self.rank_coef_final = float(self.train_cfg.get("rank_coef_final", self.rank_coef_start))
         self.rank_coef_decay_epochs = max(1, int(self.train_cfg.get("rank_coef_decay_epochs", self.epochs)))
         self.grad_clip = float(self.train_cfg.get("grad_clip", 1.0))
-        default_loss_weights = {"listmle": 1.0, "mse_norm": 0.1, "mse_raw": 0.01}
+        default_loss_weights = {"listmle": 1.0, "mse_norm": 0.01, "mse_raw": 0.01}
         cfg_loss_weights = self.train_cfg.get("pretrain_loss_weights") or {}
         self.pretrain_loss_weights = {
             "listmle": float(cfg_loss_weights.get("listmle", default_loss_weights["listmle"])),
             "mse_norm": float(cfg_loss_weights.get("mse_norm", default_loss_weights["mse_norm"])),
             "mse_raw": float(cfg_loss_weights.get("mse_raw", default_loss_weights["mse_raw"])),
         }
+        self.pretrain_entropy_coef = float(self.train_cfg.get("pretrain_entropy_coef", 0.0))
         self.early_stop_patience = int(self.train_cfg.get("early_stop_patience", 20))
         self.log_interval = int(self.train_cfg.get("log_interval", 50))
         self.pretrain_epochs = int(self.train_cfg.get("pretrain_epochs", 5))
@@ -482,19 +483,24 @@ class Trainer:
                 listmle_loss = compute_listmle_loss_vectorized(logits, rewards_norm, mask)
                 
                 # 2. MSE Loss (Value stability on normed labels)
-                masked_logits = logits[mask]
+                valid_logits = logits[mask]
                 masked_norm_rewards = rewards_norm[mask]
                 target_rewards = masked_norm_rewards * self.pretrain_value_scale
-                mse_norm = mse_loss_fn(masked_logits, target_rewards)
+                mse_norm = mse_loss_fn(valid_logits, target_rewards)
 
                 # 3. Raw reward regression (anchors RL objective)
                 masked_raw_rewards = rewards_raw[mask]
-                mse_raw = mse_loss_fn(masked_logits, masked_raw_rewards)
+                mse_raw = mse_loss_fn(valid_logits, masked_raw_rewards)
+
+                masked_logits_full = logits.masked_fill(~mask, -1e9)
+                probs = F.softmax(masked_logits_full, dim=-1)
+                entropy = -(probs * F.log_softmax(masked_logits_full, dim=-1)).sum(dim=-1).mean()
 
                 loss = (
                     loss_w["listmle"] * listmle_loss
                     + loss_w["mse_norm"] * mse_norm
                     + loss_w["mse_raw"] * mse_raw
+                    - self.pretrain_entropy_coef * entropy
                 )
                 
                 rank_corr = compute_rank_correlation(logits, rewards_norm, mask).mean()
@@ -502,9 +508,7 @@ class Trainer:
                 self._backward_with_accum(loss, count_global_step=False)
 
                 # Diagnostics: entropy and top-k raw return
-                masked_logits = logits.masked_fill(~mask, -1e9)
-                probs = F.softmax(masked_logits, dim=-1)
-                entropy = -(probs * F.log_softmax(masked_logits, dim=-1)).sum(dim=-1).mean()
+                entropy_value = entropy.detach().item()
                 weights = compute_topk_weights(
                     logits=logits.detach(), mask=mask, top_k=self.start_top_k,
                     temperature=self.temperature, min_weight=0.0, differentiable=True,
@@ -514,7 +518,7 @@ class Trainer:
                 total_loss += loss.item()
                 total_rank_corr += rank_corr.item()
                 total_topk_return += avg_topk.item()
-                total_entropy += entropy.item()
+                total_entropy += entropy_value
                 steps += 1
                 if rank_corr.item() < -0.05:
                     warn_flag = True
@@ -527,7 +531,7 @@ class Trainer:
                     "mse_norm": mse_norm.item(),
                     "mse_raw": mse_raw.item(),
                     "rank_corr": rank_corr.item(),
-                    "entropy": entropy.item(),
+                    "entropy": entropy_value,
                     "avg_topk_raw_return": avg_topk.item(),
                 }
                 self.logger.log_metrics("pretrain_step", step_metrics, step=step + (epoch - 1) * len(loader))

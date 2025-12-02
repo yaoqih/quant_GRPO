@@ -70,7 +70,7 @@ training:
   device: auto
   epochs: 40
   batch_size: 8
-  pretrain_value_scale: 10
+  pretrain_value_scale: 2
   learning_rate: 0.0003
   weight_decay: 0.01
   entropy_coef: 0.001
@@ -100,9 +100,10 @@ training:
   ppo_epochs: 4
 
   pretrain_loss_weights:
-    listmle: 0.5
-    mse_norm: 0.02
-    mse_raw: 0.005
+    listmle: 1.0
+    mse_norm: 0.01
+    mse_raw: 0.01
+  pretrain_entropy_coef: 0.001
 
   dataloader:
     num_workers: 16
