@@ -460,7 +460,7 @@ class Trainer:
                 masked_raw_rewards = rewards_raw[mask]
                 mse_raw = mse_loss_fn(masked_logits, masked_raw_rewards)
 
-                loss = listmle_loss + 0.1 * mse_norm + 0.01 * mse_raw
+                loss = listmle_loss *0.5 + mse_norm*0.05 + mse_raw*0.01
                 
                 rank_corr = compute_rank_correlation(logits, rewards_norm, mask).mean()
 

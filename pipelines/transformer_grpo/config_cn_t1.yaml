@@ -69,10 +69,11 @@ training:
   seed: 42
   device: auto
   epochs: 40
-  batch_size: 4
-  learning_rate: 0.0005
+  batch_size: 8
+  pretrain_value_scale: 3
+  learning_rate: 0.0001
   weight_decay: 0.01
-  entropy_coef: 0.0001
+  entropy_coef: 0.001
   rank_coef: 0.05
   rank_coef_final: 0.0
   rank_coef_decay_epochs: 10
@@ -86,19 +87,19 @@ training:
   turnover_cost: 0.001
   grad_clip: 1.0
   early_stop_patience: 20
-  pretrain_epochs: 3
+  pretrain_epochs: 20
   continue_rl_after_pretrain: false
   checkpoint_root: runs/transformer_grpo
   log_interval: 50
-  use_cosine_lr: true
-  temperature: 0.7
+  use_cosine_lr: false
+  temperature: 1.5
   train_top_k: 6      # 初始 K (Start)
   min_train_top_k: 4   # 最终 K (End)
   k_decay_strategy: "linear" # linear, cosine, step
   ppo_epochs: 4
 
   dataloader:
-    num_workers: 12
+    num_workers: 16
     pin_memory: true
     persistent_workers: true
     prefetch_factor: 8

@@ -8,3 +8,5 @@ pip install pyqlib wandb awscli
 cd quant_GRPO
 python -m pipelines.transformer_grpo.trainer --config pipelines/transformer_grpo/config_cn_t1.yaml
 # fee8445a6ea62fb7db5fadd1321f5b0f6b5420a6
+git config --global user.email "1375626371@qq.com"
+git config --global user.name "huyaoqi"
