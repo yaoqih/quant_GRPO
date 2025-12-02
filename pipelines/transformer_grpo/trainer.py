@@ -191,6 +191,7 @@ class Trainer:
         self.log_interval = int(self.train_cfg.get("log_interval", 50))
         self.pretrain_epochs = int(self.train_cfg.get("pretrain_epochs", 5))
         self.continue_rl = bool(self.train_cfg.get("continue_rl_after_pretrain", True))
+        self.skip_rl_training = False
         default_pretrain_scale = 100.0 if self.reward_scale == 1.0 else 1.0
         self.pretrain_value_scale = float(self.train_cfg.get("pretrain_value_scale", default_pretrain_scale))
 
@@ -240,7 +241,7 @@ class Trainer:
 
         if self.pretrain_epochs > 0 and not self.continue_rl:
             print("[Trainer] RL training skipped per configuration `continue_rl_after_pretrain=False`.")
-            self.logger.close()
+            self.skip_rl_training = True
             return
 
     def _resolve_device(self, requested: str) -> torch.device:
@@ -543,6 +544,9 @@ class Trainer:
 
     def train(self):
         """主训练循环"""
+        if getattr(self, "skip_rl_training", False):
+            self.logger.close()
+            return
         train_loader = self._build_loader(self.train_dataset, shuffle=True)
         best_metric = float("-inf")
         best_epoch = 0
