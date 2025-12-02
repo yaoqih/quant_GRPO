@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 
+import math
 import numpy as np
 import pandas as pd
 import torch
@@ -61,8 +62,6 @@ def compute_listmle_loss_vectorized(logits: torch.Tensor, rewards: torch.Tensor,
 
     ListMLE: 给定真实排序，最大化按此排序采样的概率。
     """
-    batch_size, num_inst = logits.shape
-    device = logits.device
 
     # 按reward排序，获取排序索引
     # 将无效位置的reward设为-inf使其排在最后
@@ -94,7 +93,21 @@ def compute_listmle_loss_vectorized(logits: torch.Tensor, rewards: torch.Tensor,
     avg_tokens = n_valid.mean().clamp(min=1.0)
     return batch_loss.mean() / avg_tokens
 
-import math
+
+def compute_ic_loss(logits: torch.Tensor, rewards: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Information Coefficient loss == -cosine similarity between prediction and target ranks."""
+    mask = mask.to(logits.dtype)
+    masked_count = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+
+    logits_centered = (logits * mask) - ((logits * mask).sum(dim=1, keepdim=True) / masked_count)
+    rewards_centered = (rewards * mask) - ((rewards * mask).sum(dim=1, keepdim=True) / masked_count)
+
+    numerator = (logits_centered * rewards_centered * mask).sum(dim=1)
+    logits_norm = torch.sqrt((logits_centered.pow(2) * mask).sum(dim=1).clamp(min=eps))
+    rewards_norm = torch.sqrt((rewards_centered.pow(2) * mask).sum(dim=1).clamp(min=eps))
+    ic = numerator / (logits_norm * rewards_norm).clamp(min=eps)
+    ic = torch.where(mask.sum(dim=1) < 2, torch.zeros_like(ic), ic)
+    return -ic.mean()
 
 class TopKScheduler:
     def __init__(self, start_k: int, end_k: int, total_epochs: int, strategy: str = "linear"):
@@ -187,12 +200,11 @@ class Trainer:
         self.rank_coef_final = float(self.train_cfg.get("rank_coef_final", self.rank_coef_start))
         self.rank_coef_decay_epochs = max(1, int(self.train_cfg.get("rank_coef_decay_epochs", self.epochs)))
         self.grad_clip = float(self.train_cfg.get("grad_clip", 1.0))
-        default_loss_weights = {"listmle": 1.0, "mse_norm": 0.005, "mse_raw": 0.002}
+        default_loss_weights = {"listmle": 1.0, "ic": 1.0}
         cfg_loss_weights = self.train_cfg.get("pretrain_loss_weights") or {}
         self.pretrain_loss_weights = {
             "listmle": float(cfg_loss_weights.get("listmle", default_loss_weights["listmle"])),
-            "mse_norm": float(cfg_loss_weights.get("mse_norm", default_loss_weights["mse_norm"])),
-            "mse_raw": float(cfg_loss_weights.get("mse_raw", default_loss_weights["mse_raw"])),
+            "ic": float(cfg_loss_weights.get("ic", default_loss_weights["ic"])),
         }
         self.pretrain_entropy_coef = float(self.train_cfg.get("pretrain_entropy_coef", 0.0))
         self.pretrain_listmle_warmup_steps = max(0, int(self.train_cfg.get("pretrain_listmle_warmup_steps", 0)))
@@ -203,8 +215,7 @@ class Trainer:
         self.skip_rl_training = False
         self.grad_accum_steps = max(1, int(self.train_cfg.get("grad_accum_steps", 1)))
         self._grad_accum_counter = 0
-        default_pretrain_scale = 100.0 if self.reward_scale == 1.0 else 1.0
-        self.pretrain_value_scale = float(self.train_cfg.get("pretrain_value_scale", default_pretrain_scale))
+        self.feature_l1_coef = float(self.train_cfg.get("feature_l1_coef", 0.0))
 
         # GRPO Params
         self.group_size = int(self.train_cfg.get("group_size", 4))
@@ -216,6 +227,7 @@ class Trainer:
         self.min_kl_coef = float(self.train_cfg.get("min_kl_coef", 1e-5))
         self.max_kl_coef = float(self.train_cfg.get("max_kl_coef", 0.05))
         self.turnover_cost = float(self.train_cfg.get("turnover_cost", 0.0))
+        self.rank_loss_type = (self.train_cfg.get("rank_loss_type") or "ic").lower()
 
         # Top-k参数
         # --- Top-K Scheduler Params ---
@@ -290,6 +302,15 @@ class Trainer:
             self.kl_coef = min(self.kl_coef * self.kl_adjust_rate, self.max_kl_coef)
         elif low_thr > 0 and avg_kl < low_thr:
             self.kl_coef = max(self.kl_coef / self.kl_adjust_rate, self.min_kl_coef)
+
+    def _compute_aux_rank_loss(self, logits: torch.Tensor, rewards: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if self.rank_loss_type == "listmle":
+            return compute_listmle_loss_vectorized(logits, rewards, mask)
+        if self.rank_loss_type == "hybrid":
+            listmle = compute_listmle_loss_vectorized(logits, rewards, mask)
+            ic_loss = compute_ic_loss(logits, rewards, mask)
+            return 0.5 * (listmle + ic_loss)
+        return compute_ic_loss(logits, rewards, mask)
 
     def _build_datasets(self):
         """构建数据集，顺序处理以减少内存峰值。"""
@@ -459,11 +480,10 @@ class Trainer:
             self._step_optimizer(count_global_step)
 
     def _pretrain_policy(self):
-        """Pretraining phase: ListMLE + MSE for stability."""
+        """Pretraining phase: ListMLE + IC loss for cross-sectional ranking."""
         loader = self._build_loader(self.train_dataset, shuffle=True)
         print(f"[Pretrain] Starting supervised warm-up for {self.pretrain_epochs} epoch(s)")
         
-        mse_loss_fn = torch.nn.MSELoss()
         loss_w = self.pretrain_loss_weights
         pretrain_global_step = 0
 
@@ -481,18 +501,8 @@ class Trainer:
 
                 logits, _ = self.model(features, mask)
 
-                # 1. ListMLE Loss (Ranking)
                 listmle_loss = compute_listmle_loss_vectorized(logits, rewards_norm, mask)
-                
-                # 2. MSE Loss (Value stability on normed labels)
-                valid_logits = logits[mask]
-                masked_norm_rewards = rewards_norm[mask]
-                target_rewards = masked_norm_rewards * self.pretrain_value_scale
-                mse_norm = mse_loss_fn(valid_logits, target_rewards)
-
-                # 3. Raw reward regression (anchors RL objective)
-                masked_raw_rewards = rewards_raw[mask]
-                mse_raw = mse_loss_fn(valid_logits, masked_raw_rewards)
+                ic_loss = compute_ic_loss(logits, rewards_norm, mask)
 
                 masked_logits_full = logits.masked_fill(~mask, -1e9)
                 probs = F.softmax(masked_logits_full, dim=-1)
@@ -502,12 +512,11 @@ class Trainer:
                 if self.pretrain_listmle_warmup_steps > 0:
                     warmup_scale = min(pretrain_global_step / self.pretrain_listmle_warmup_steps, 1.0)
 
-                loss = (
-                    loss_w["listmle"] * listmle_loss
-                    + (loss_w["mse_norm"] * warmup_scale) * mse_norm
-                    + (loss_w["mse_raw"] * warmup_scale) * mse_raw
-                    - self.pretrain_entropy_coef * entropy
-                )
+                listmle_term = loss_w["listmle"] * listmle_loss * warmup_scale
+                ic_term = loss_w["ic"] * ic_loss
+
+                l1_penalty = self.model.feature_l1_penalty() if self.feature_l1_coef > 0 else logits.new_zeros(())
+                loss = listmle_term + ic_term - self.pretrain_entropy_coef * entropy + self.feature_l1_coef * l1_penalty
                 
                 rank_corr = compute_rank_correlation(logits, rewards_norm, mask).mean()
 
@@ -534,8 +543,8 @@ class Trainer:
                     "step": step,
                     "loss": loss.item(),
                     "listmle_loss": listmle_loss.item(),
-                    "mse_norm": mse_norm.item(),
-                    "mse_raw": mse_raw.item(),
+                    "ic_loss": ic_loss.item(),
+                    "feature_l1": l1_penalty.item() if self.feature_l1_coef > 0 else 0.0,
                     "rank_corr": rank_corr.item(),
                     "entropy": entropy_value,
                     "avg_topk_raw_return": avg_topk.item(),
@@ -730,9 +739,10 @@ class Trainer:
 
                 rank_loss = None
                 if rank_coef_value > 0:
-                    rank_loss = compute_listmle_loss_vectorized(logits, rewards_norm, mask)
+                    rank_loss = self._compute_aux_rank_loss(logits, rewards_norm, mask)
 
-                loss = pg_loss - self.entropy_coef * entropy + self.kl_coef * kl_div
+                l1_penalty = self.model.feature_l1_penalty() if self.feature_l1_coef > 0 else logits.new_zeros(())
+                loss = pg_loss - self.entropy_coef * entropy + self.kl_coef * kl_div + self.feature_l1_coef * l1_penalty
                 if rank_loss is not None:
                     loss = loss + rank_coef_value * rank_loss
 
@@ -758,6 +768,7 @@ class Trainer:
                         "loss": loss.item(),
                         "pg_loss": pg_loss.item(),
                         "rank_loss": rank_loss_value,
+                        "feature_l1": l1_penalty.item() if self.feature_l1_coef > 0 else 0.0,
                         "entropy": entropy.item(),
                         "kl": kl_div.item(),
                         "avg_return": avg_return_value,

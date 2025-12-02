@@ -206,9 +206,7 @@ class DailyBatchFactory:
         self.max_instruments = max_instruments
         self.reward_clip = reward_clip
         self.reward_scale = reward_scale
-        self.reward_normalize = reward_normalize or {}
-        self.reward_norm_type = (self.reward_normalize.get("type") or "").lower()
-        self.reward_norm_eps = float(self.reward_normalize.get("eps", 1e-6))
+        self.target_eps = float((reward_normalize or {}).get("eps", 1e-6))
         if instrument_universe is not None:
             inst_list = [str(inst) for inst in instrument_universe]
             self.instrument_universe = set(inst_list)
@@ -320,23 +318,16 @@ class DailyBatchFactory:
                 if day_instruments.size == 0:
                     continue
 
+                cs_targets = _cross_sectional_standardize(day_rewards, eps=self.target_eps)
+
                 raw_rewards = day_rewards.astype(np.float32, copy=True)
                 if self.reward_clip is not None:
                     raw_rewards = np.clip(raw_rewards, self.reward_clip[0], self.reward_clip[1])
                 if self.reward_scale != 1.0:
                     raw_rewards = raw_rewards * self.reward_scale
 
-                norm_rewards = raw_rewards.astype(np.float32, copy=True)
-                if self.reward_norm_type == "zscore":
-                    mean = float(np.mean(norm_rewards))
-                    std = float(np.std(norm_rewards))
-                    if std < self.reward_norm_eps:
-                        norm_rewards = norm_rewards - mean
-                    else:
-                        norm_rewards = (norm_rewards - mean) / max(std, self.reward_norm_eps)
-
                 day_feats = np.nan_to_num(day_feats, nan=0.0, posinf=0.0, neginf=0.0)
-                norm_rewards = np.nan_to_num(norm_rewards, nan=0.0, posinf=0.0, neginf=0.0)
+                cs_targets = np.nan_to_num(cs_targets, nan=0.0, posinf=0.0, neginf=0.0)
                 raw_rewards = np.nan_to_num(raw_rewards, nan=0.0, posinf=0.0, neginf=0.0)
 
                 instruments = day_instruments.astype(object, copy=True)
@@ -346,7 +337,7 @@ class DailyBatchFactory:
                     date=current_date,
                     instruments=instruments,
                     features=day_feats,
-                    rewards=norm_rewards,
+                    rewards=cs_targets,
                     raw_rewards=raw_rewards,
                     index_map=index_map,
                     feature_dim=day_feats.shape[1],
@@ -582,3 +573,15 @@ def _flatten_columns(frame: pd.DataFrame) -> pd.DataFrame:
     else:
         new_cols = [str(col) for col in frame.columns]
     return frame.set_axis(new_cols, axis=1, copy=False)
+
+
+def _cross_sectional_standardize(values: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float32)
+    if arr.size == 0:
+        return arr
+    mean = float(np.mean(arr))
+    centered = arr - mean
+    std = float(np.std(centered))
+    if std < eps:
+        return centered
+    return centered / max(std, eps)
