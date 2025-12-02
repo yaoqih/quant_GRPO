@@ -22,7 +22,7 @@
    ```bash
    python -m pipelines.transformer_grpo.run_backtest \
      --config pipelines/transformer_grpo/config_cn_t1.yaml \
-     --checkpoint runs/transformer_grpo/<timestamp>/best.pt \
+     --checkpoint runs/transformer_grpo/20251202_134906/pretrain.pt \
      --segment test --out_dir runs/eval/test \
      --top_k 3 --hold_threshold 0.45 --min_weight 0.05 \
      --max_gross_exposure 1.0 --cash_token CASH

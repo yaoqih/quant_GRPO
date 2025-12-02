@@ -594,6 +594,24 @@ class Trainer:
             self.logger.log_metrics("pretrain_backtest", summary)
             print(f"[Pretrain] Sanity backtest sharpe={summary.get('sharpe', 0):.4f}, "
                   f"cum_return={summary.get('cumulative_return', 0):.4f}")
+            print("[Pretrain] Running sanity backtest on test split...")
+            trades, summary = run_backtest(
+                model=self.model,
+                dataset=self.test_dataset,
+                device=self.device,
+                top_k=int(self.backtest_cfg.get("top_k", self.start_top_k)),
+                temperature=float(self.backtest_cfg.get("temperature", 1.0)),
+                min_weight=float(self.backtest_cfg.get("min_weight", 0.0)),
+                commission=float(self.backtest_cfg.get("commission", 0.0)),
+                slippage=float(self.backtest_cfg.get("slippage", 0.0)),
+                reward_scale=self.reward_scale,
+            )
+            pretrain_dir = ensure_dir(self.work_dir / "pretrain_test")
+            save_trades(trades, pretrain_dir / "pretrain_trades.csv")
+            (pretrain_dir / "pretrain_metrics.json").write_text(json.dumps(summary, indent=2))
+            self.logger.log_metrics("pretrain_backtest", summary)
+            print(f"[Pretrain] Sanity backtest sharpe={summary.get('sharpe', 0):.4f}, "
+                  f"cum_return={summary.get('cumulative_return', 0):.4f}")
 
     def train(self):
         """主训练循环"""
