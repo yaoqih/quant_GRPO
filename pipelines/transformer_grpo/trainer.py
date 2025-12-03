@@ -164,6 +164,7 @@ class Trainer:
         self._grad_accum_counter = 0
         self.feature_l1_coef = float(self.train_cfg.get("feature_l1_coef", 0.0))
         self.pretrain_early_stop_patience = int(self.train_cfg.get("pretrain_early_stop_patience", 0))
+        self.eval_test_each_epoch = bool(self.train_cfg.get("eval_test_each_epoch", False))
 
         # RL Objective Params
         self.turnover_cost = float(self.train_cfg.get("turnover_cost", 0.0))
@@ -246,7 +247,7 @@ class Trainer:
         if not ckpt_path.exists():
             raise FileNotFoundError(f"RL checkpoint {ckpt_path} not found.")
         print(f"[Trainer] Loading RL initialization weights from {ckpt_path}")
-        checkpoint = torch.load(ckpt_path, map_location=self.device)
+        checkpoint = torch.load(ckpt_path, map_location=self.device,weights_only=False)
         state_dict = checkpoint.get("model_state", checkpoint)
         missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
         if missing or unexpected:
@@ -727,6 +728,7 @@ class Trainer:
                 self.logger.log_metrics("train_epoch", {"epoch": epoch, **train_stats})
 
                 val_stats = {}
+                test_stats = {}
                 if len(self.valid_dataset) > 0:
                     _, val_stats = self.evaluate(self.valid_dataset, "valid", epoch)
                     metric_val = val_stats.get("sharpe", float("-inf"))
@@ -739,7 +741,11 @@ class Trainer:
                         self.no_improve_epochs += 1
                     self.logger.log_metrics("valid_epoch", {"epoch": epoch, **val_stats})
 
-                record = {"epoch": epoch, "train": train_stats, "valid": val_stats}
+                if self.eval_test_each_epoch and len(self.test_dataset) > 0:
+                    _, test_stats = self.evaluate(self.test_dataset, "test", epoch)
+                    self.logger.log_metrics("test_epoch", {"epoch": epoch, **test_stats})
+
+                record = {"epoch": epoch, "train": train_stats, "valid": val_stats, "test": test_stats}
                 with self.history_file.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(record, default=str) + "\n")
 

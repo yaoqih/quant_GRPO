@@ -87,6 +87,7 @@ training:
   early_stop_patience: 20
   pretrain_epochs: 20
   pretrain_early_stop_patience: 5   # 0 disables valid-based early stop
+  eval_test_each_epoch: test       # true logs test metrics every epoch (disables strict test isolation)
   continue_rl_after_pretrain: false
   checkpoint_root: runs/transformer_grpo
   log_interval: 50
