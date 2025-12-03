@@ -163,6 +163,7 @@ class Trainer:
         self.grad_accum_steps = max(1, int(self.train_cfg.get("grad_accum_steps", 1)))
         self._grad_accum_counter = 0
         self.feature_l1_coef = float(self.train_cfg.get("feature_l1_coef", 0.0))
+        self.pretrain_early_stop_patience = int(self.train_cfg.get("pretrain_early_stop_patience", 0))
 
         # RL Objective Params
         self.turnover_cost = float(self.train_cfg.get("turnover_cost", 0.0))
@@ -556,6 +557,9 @@ class Trainer:
         loss_w = self.pretrain_loss_weights
         pretrain_global_step = 0
 
+        use_valid_early_stop = self.pretrain_early_stop_patience > 0 and len(self.valid_dataset) > 0
+        best_val_loss = float("inf")
+        pretrain_no_improve = 0
         for epoch in range(1, self.pretrain_epochs + 1):
             self.model.train()
             total_loss = 0.0
@@ -657,6 +661,16 @@ class Trainer:
                         f"[Pretrain {epoch}] valid_loss={val_metrics['loss']:.4f} "
                         f"gap={loss_gap:.4f} ratio={overfit_ratio:.3f}"
                     )
+                    if use_valid_early_stop:
+                        val_loss = val_metrics["loss"]
+                        if val_loss < best_val_loss - 1e-8:
+                            best_val_loss = val_loss
+                            pretrain_no_improve = 0
+                        else:
+                            pretrain_no_improve += 1
+                            if pretrain_no_improve >= self.pretrain_early_stop_patience:
+                                print(f"[Pretrain EarlyStop] No valid improvement for {self.pretrain_early_stop_patience} epoch(s).")
+                                break
 
         print("[Pretrain] Completed")
         # Optional quick sanity backtest on validation segment

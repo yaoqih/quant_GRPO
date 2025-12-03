@@ -86,6 +86,7 @@ training:
   grad_accum_steps: 24
   early_stop_patience: 20
   pretrain_epochs: 20
+  pretrain_early_stop_patience: 5   # 0 disables valid-based early stop
   continue_rl_after_pretrain: false
   checkpoint_root: runs/transformer_grpo
   log_interval: 50
