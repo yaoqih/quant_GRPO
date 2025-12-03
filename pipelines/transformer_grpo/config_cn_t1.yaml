@@ -73,16 +73,14 @@ training:
   learning_rate: 0.0003
   weight_decay: 0.01
   entropy_coef: 0.001
+  rl_objective: sharpe   # sharpe | dpr | hybrid
+  downside_lambda: 0.5
+  sharpe_eps: 1.0e-04
+  rl_checkpoint_path: null   # set to a ckpt to skip pretrain and start RL-only
+  load_rl_optimizer: false
   rank_coef: 0.05
   rank_coef_final: 0.0
   rank_coef_decay_epochs: 10
-  group_size: 8
-  clip_ratio: 0.2
-  kl_coef: 0.003
-  target_kl: 0.02
-  kl_adjust_rate: 1.5
-  min_kl_coef: 1.0e-05
-  max_kl_coef: 0.05
   turnover_cost: 0.001
   grad_clip: 1.0
   grad_accum_steps: 24
@@ -93,10 +91,9 @@ training:
   log_interval: 50
   use_cosine_lr: false
   temperature: 1.0
-  train_top_k: 6      # 初始 K (Start)
-  min_train_top_k: 4   # 最终 K (End)
-  k_decay_strategy: "linear" # linear, cosine, step
-  ppo_epochs: 4
+  train_top_k: 1
+  rl_top_k: 1
+  rl_temperature: 0.2
 
   pretrain_loss_weights:
     listmle: 1.2

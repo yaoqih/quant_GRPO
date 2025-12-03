@@ -199,14 +199,21 @@ def compute_topk_weights(
     fill_value = -1e9
     masked_logits = logits.masked_fill(~mask, fill_value)
     
+    focus_topk = top_k is not None and int(top_k) > 0
+    effective_k = int(top_k) if focus_topk else logits.size(-1)
+    effective_k = max(1, min(effective_k, logits.size(-1)))
+
     if differentiable:
-        # Training: Softmax attention across ALL valid stocks
-        # We generally do NOT enforce strict Top-K here to allow gradient flow to all
-        # valid candidates. The temperature controls concentration.
+        # Training: Softmax attention across ALL valid stocks, optionally truncating to Top-K
         scores = masked_logits / max(temperature, 1e-4)
         scores = scores - scores.max(dim=-1, keepdim=True).values.detach()
         weights = F.softmax(scores, dim=-1)
         weights = weights * mask.float()
+        if focus_topk and effective_k < logits.size(-1):
+            _, topk_idx = torch.topk(masked_logits, k=effective_k, dim=-1)
+            topk_mask = torch.zeros_like(masked_logits, dtype=torch.bool)
+            topk_mask.scatter_(1, topk_idx, True)
+            weights = weights * topk_mask.float()
     else:
         # Inference: Hard Top-K selection
         # 1. Calculate probabilities
@@ -220,7 +227,7 @@ def compute_topk_weights(
         
         # We need a loop or careful broadcasting if K varies per batch (it usually doesn't here)
         # Assuming constant K for simplicity or taking min across batch
-        eff_k = min(top_k, logits.size(-1))
+        eff_k = min(effective_k, logits.size(-1))
         
         topk_vals, topk_inds = torch.topk(probs, eff_k, dim=-1)
         
@@ -245,54 +252,6 @@ def compute_topk_weights(
         weights = weights.squeeze(0)
         
     return weights
-
-
-def sample_topk_actions(
-    logits: torch.Tensor,
-    mask: torch.Tensor,
-    top_k: int,
-    group_size: int,
-    temperature: float = 1.0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Sample `group_size` actions for each batch item (independent sets) via Gumbel-TopK.
-    Fully vectorized to keep sampling on GPU.
-    """
-    batch_size, num_inst = logits.shape
-    temperature = max(float(temperature), 1e-4)
-    masked_logits = logits.masked_fill(~mask, -1e9)
-    log_probs = F.log_softmax(masked_logits / temperature, dim=-1)  # [B, N]
-
-    if top_k <= 0 or group_size <= 0:
-        empty_mask = torch.zeros(batch_size, group_size, num_inst, dtype=torch.bool, device=logits.device)
-        empty_logprob = torch.zeros(batch_size, group_size, device=logits.device)
-        return empty_mask, empty_logprob
-
-    gumbel_shape = (batch_size, group_size, num_inst)
-    # Avoid log(0) by clamping to tiny positive number
-    uniform = torch.rand(gumbel_shape, device=logits.device).clamp_(min=1e-9, max=1 - 1e-9)
-    gumbels = -torch.log(-torch.log(uniform))
-
-    scores = log_probs.unsqueeze(1) + gumbels  # [B, G, N]
-    scores = scores.masked_fill(~mask.unsqueeze(1), float("-inf"))
-
-    k = min(int(top_k), num_inst)
-    _, topk_idx = torch.topk(scores, k=k, dim=-1)
-
-    repeated_mask = mask.unsqueeze(1).expand_as(scores)
-    valid_flags = torch.gather(repeated_mask, 2, topk_idx)
-
-    sampled_masks = torch.zeros_like(scores, dtype=torch.bool)
-    sampled_masks.scatter_(2, topk_idx, valid_flags)
-
-    expanded_log_probs = log_probs.unsqueeze(1).expand_as(scores)
-    selected_log_probs = torch.gather(expanded_log_probs, 2, topk_idx)
-    valid_float = valid_flags.float()
-    counts = valid_float.sum(dim=-1).clamp_min(1.0)
-    sample_log_probs = (selected_log_probs * valid_float).sum(dim=-1) / counts
-
-    return sampled_masks, sample_log_probs
-
 
 
 def collate_daily_batches(samples: List[DailyBatch]) -> Dict[str, object]:

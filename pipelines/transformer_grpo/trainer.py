@@ -8,7 +8,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 
-import math
 import numpy as np
 import pandas as pd
 import torch
@@ -28,7 +27,6 @@ from .utils import (
     compute_topk_weights,
     ensure_dir,
     set_global_seed,
-    sample_topk_actions,
     LengthAwareBatchSampler,
 )
 
@@ -109,59 +107,8 @@ def compute_ic_loss(logits: torch.Tensor, rewards: torch.Tensor, mask: torch.Ten
     ic = torch.where(mask.sum(dim=1) < 2, torch.zeros_like(ic), ic)
     return -ic.mean()
 
-class TopKScheduler:
-    def __init__(self, start_k: int, end_k: int, total_epochs: int, strategy: str = "linear"):
-        """
-        Top-K 调度器
-        
-        Args:
-            start_k: 初始 Top-K (例如 30)
-            end_k: 最终 Top-K (例如 5)
-            total_epochs: 总 Epoch 数
-            strategy: 'linear' (线性) 或 'cosine' (余弦退火)
-        """
-        self.start_k = start_k
-        self.end_k = max(1, end_k) # 保证至少为1
-        self.total_epochs = total_epochs
-        self.strategy = strategy
-
-    def get_k(self, current_epoch: int) -> int:
-        """根据当前 epoch (1-based) 返回当前的 k 值"""
-        # 防止越界
-        if current_epoch >= self.total_epochs:
-            return self.end_k
-        if current_epoch <= 0:
-            return self.start_k
-
-        # 进度 (0.0 -> 1.0)
-        progress = (current_epoch - 1) / (self.total_epochs - 1)
-
-        if self.strategy == "linear":
-            # 线性衰减: k = start - (start - end) * progress
-            k = self.start_k - (self.start_k - self.end_k) * progress
-        
-        elif self.strategy == "cosine":
-            # 余弦衰减: 也就是先慢，中间快，最后慢
-            cosine_progress = 0.5 * (1 + math.cos(progress * math.pi))
-            # 注意：cosine 是从 1 到 -1 (或类似)，这里简化为权重混合
-            # 修正公式：start + (end - start) * (1 - cosine_decay)
-            # 简单写法：使用 standard cosine annealing logic
-            k = self.end_k + 0.5 * (self.start_k - self.end_k) * (1 + math.cos(progress * math.pi))
-            
-        elif self.strategy == "step":
-            # 阶梯衰减：每过 1/3 阶段减半，或者自定义
-            # 这里简单实现：前50%用 start_k，后50%线性降到 end_k
-            if progress < 0.5:
-                k = self.start_k
-            else:
-                ratio = (progress - 0.5) * 2
-                k = self.start_k - (self.start_k - self.end_k) * ratio
-        else:
-            k = self.start_k
-
-        return max(1, int(round(k)))
 class Trainer:
-    """GRPO (Group Relative Policy Optimization) Trainer."""
+    """Differentiable Sharpe trainer for cross-sectional policies."""
 
     def __init__(self, config: Dict):
         self.config = config
@@ -217,52 +164,41 @@ class Trainer:
         self._grad_accum_counter = 0
         self.feature_l1_coef = float(self.train_cfg.get("feature_l1_coef", 0.0))
 
-        # GRPO Params
-        self.group_size = int(self.train_cfg.get("group_size", 4))
-        self.ppo_epochs = max(1, int(self.train_cfg.get("ppo_epochs", 1)))
-        self.clip_ratio = float(self.train_cfg.get("clip_ratio", 0.2))
-        self.kl_coef = float(self.train_cfg.get("kl_coef", 0.0))
-        self.target_kl = float(self.train_cfg.get("target_kl", 0.02))
-        self.kl_adjust_rate = float(self.train_cfg.get("kl_adjust_rate", 1.5))
-        self.min_kl_coef = float(self.train_cfg.get("min_kl_coef", 1e-5))
-        self.max_kl_coef = float(self.train_cfg.get("max_kl_coef", 0.05))
+        # RL Objective Params
         self.turnover_cost = float(self.train_cfg.get("turnover_cost", 0.0))
         self.rank_loss_type = (self.train_cfg.get("rank_loss_type") or "ic").lower()
-
-        # Top-k参数
-        # --- Top-K Scheduler Params ---
-        self.start_top_k = int(self.train_cfg.get("train_top_k", 10))
-        # 如果没配置 min_train_top_k，默认不衰减 (end_k = start_k)
-        self.end_top_k = int(self.train_cfg.get("min_train_top_k", self.start_top_k))
-        self.k_decay_strategy = self.train_cfg.get("k_decay_strategy", "linear")
-
-        # 初始化调度器
-        self.k_scheduler = TopKScheduler(
-            start_k=self.start_top_k,
-            end_k=self.end_top_k,
-            total_epochs=self.epochs,
-            strategy=self.k_decay_strategy
-        )
-        
-        # 初始 current_k
-        self.current_train_k = self.start_top_k
+        self.start_top_k = max(1, int(self.train_cfg.get("train_top_k", 1)))
         self.temperature = float(self.train_cfg.get("temperature", 1.0))
+        self.rl_top_k = max(1, int(self.train_cfg.get("rl_top_k", self.start_top_k)))
+        self.rl_temperature = float(self.train_cfg.get("rl_temperature", max(self.temperature, 1e-3)))
+        self.rl_objective = (self.train_cfg.get("rl_objective", "sharpe") or "sharpe").lower()
+        self.downside_lambda = float(self.train_cfg.get("downside_lambda", 0.5))
+        self.sharpe_eps = float(self.train_cfg.get("sharpe_eps", 1e-4))
+        rl_ckpt = self.train_cfg.get("rl_checkpoint_path")
+        self.rl_checkpoint_path = Path(rl_ckpt).expanduser() if rl_ckpt else None
+        self.load_rl_optimizer = bool(self.train_cfg.get("load_rl_optimizer", False))
+        self.rl_only_mode = self.rl_checkpoint_path is not None
 
         self.global_step = 0
         self.no_improve_epochs = 0
 
         self._build_model()
+        self._maybe_load_initial_weights()
         self._save_config()
 
+        self.run_pretrain = self.pretrain_epochs > 0 and not self.rl_only_mode
+
         # 预训练
-        if self.pretrain_epochs > 0:
+        if self.run_pretrain:
             self._pretrain_policy()
             self._save_checkpoint("pretrain.pt", 0)
             if self.logger_split_runs and self.continue_rl:
                 self.logger.close()
                 self.logger = self._build_logger("rl")
+        elif self.rl_only_mode and self.pretrain_epochs > 0:
+            print(f"[Trainer] RL checkpoint provided, skipping pretrain stage (requested epochs={self.pretrain_epochs}).")
 
-        if self.pretrain_epochs > 0 and not self.continue_rl:
+        if self.pretrain_epochs > 0 and not self.continue_rl and not self.rl_only_mode:
             print("[Trainer] RL training skipped per configuration `continue_rl_after_pretrain=False`.")
             self.skip_rl_training = True
             return
@@ -293,16 +229,6 @@ class Trainer:
         progress = min(max((epoch - 1) / span, 0.0), 1.0)
         return self.rank_coef_start + (self.rank_coef_final - self.rank_coef_start) * progress
 
-    def _adjust_kl_coef(self, avg_kl: float) -> None:
-        if avg_kl <= 0:
-            return
-        high_thr = self.target_kl * 1.5
-        low_thr = self.target_kl / 1.5 if self.target_kl > 0 else 0.0
-        if avg_kl > high_thr:
-            self.kl_coef = min(self.kl_coef * self.kl_adjust_rate, self.max_kl_coef)
-        elif low_thr > 0 and avg_kl < low_thr:
-            self.kl_coef = max(self.kl_coef / self.kl_adjust_rate, self.min_kl_coef)
-
     def _compute_aux_rank_loss(self, logits: torch.Tensor, rewards: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         if self.rank_loss_type == "listmle":
             return compute_listmle_loss_vectorized(logits, rewards, mask)
@@ -311,6 +237,86 @@ class Trainer:
             ic_loss = compute_ic_loss(logits, rewards, mask)
             return 0.5 * (listmle + ic_loss)
         return compute_ic_loss(logits, rewards, mask)
+
+    def _maybe_load_initial_weights(self) -> None:
+        if not self.rl_checkpoint_path:
+            return
+        ckpt_path = self.rl_checkpoint_path
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"RL checkpoint {ckpt_path} not found.")
+        print(f"[Trainer] Loading RL initialization weights from {ckpt_path}")
+        checkpoint = torch.load(ckpt_path, map_location=self.device)
+        state_dict = checkpoint.get("model_state", checkpoint)
+        missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+        if missing or unexpected:
+            print(f"[Trainer] Warning: missing keys {missing}, unexpected keys {unexpected}")
+        if self.load_rl_optimizer and "optimizer_state" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state"])
+        if "global_step" in checkpoint:
+            self.global_step = int(checkpoint["global_step"])
+
+    def _compute_portfolio_weights(self, logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        return compute_topk_weights(
+            logits=logits,
+            mask=mask,
+            top_k=self.rl_top_k,
+            temperature=self.rl_temperature,
+            min_weight=0.0,
+            differentiable=True,
+        )
+
+    def _compute_strategy_returns(self, weights: torch.Tensor, rewards_raw: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        scale = self.reward_scale if self.reward_scale > 1e-8 else 1.0
+        per_asset_returns = rewards_raw / scale
+        gross_returns = (weights * per_asset_returns).sum(dim=-1)
+        if self.turnover_cost > 0:
+            leading_weight = weights.max(dim=-1).values
+            diversity_penalty = 1.0 - leading_weight
+            cost = self.turnover_cost * diversity_penalty
+        else:
+            cost = torch.zeros_like(gross_returns)
+        return gross_returns - cost, cost
+
+    def _sharpe_loss(self, returns: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        mean = returns.mean()
+        std = returns.std(unbiased=False).clamp_min(self.sharpe_eps)
+        sharpe = mean / std
+        loss = -sharpe
+        return loss, {
+            "objective": sharpe,
+            "mean_return": mean,
+            "std_return": std,
+            "sharpe": sharpe,
+        }
+
+    def _dpr_loss(self, returns: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        mean = returns.mean()
+        downside = torch.clamp(returns, max=0.0)
+        penalty = (downside.pow(2)).mean()
+        objective = mean - self.downside_lambda * penalty
+        std = returns.std(unbiased=False).clamp_min(self.sharpe_eps)
+        sharpe = mean / std
+        loss = -objective
+        return loss, {
+            "objective": objective,
+            "mean_return": mean,
+            "std_return": std,
+            "downside_penalty": penalty,
+            "sharpe": sharpe,
+        }
+
+    def _compute_rl_loss(self, returns: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if self.rl_objective == "dpr":
+            return self._dpr_loss(returns)
+        if self.rl_objective == "hybrid":
+            sharpe_loss, sharpe_info = self._sharpe_loss(returns)
+            dpr_loss, dpr_info = self._dpr_loss(returns)
+            loss = 0.5 * (sharpe_loss + dpr_loss)
+            merged = dict(dpr_info)
+            merged.update({k: v for k, v in sharpe_info.items() if k not in merged or k == "sharpe"})
+            merged["objective"] = 0.5 * (sharpe_info["objective"] + dpr_info["objective"])
+            return loss, merged
+        return self._sharpe_loss(returns)
 
     def _evaluate_pretrain_dataset(self, dataset: DailyBatchDataset) -> Dict[str, float]:
         if len(dataset) == 0:
@@ -703,10 +709,7 @@ class Trainer:
 
         try:
             for epoch in range(1, self.epochs + 1):
-                # --- [新增] 更新 Top-K ---
-                self.current_train_k = self.k_scheduler.get_k(epoch)
                 train_stats = self._run_epoch(train_loader, epoch)
-                self._adjust_kl_coef(train_stats.get("kl", 0.0))
                 self.logger.log_metrics("train_epoch", {"epoch": epoch, **train_stats})
 
                 val_stats = {}
@@ -726,7 +729,7 @@ class Trainer:
                 with self.history_file.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(record, default=str) + "\n")
 
-                print(f"[Epoch {epoch}] loss={train_stats['loss']:.4f} rank_corr={train_stats['rank_corr']:.4f} "
+                print(f"[Epoch {epoch}] loss={train_stats['loss']:.4f} sharpe={train_stats.get('sharpe', 0.0):.4f} "
                       f"return={train_stats['avg_return']:.5f}")
                 if val_stats:
                     print(f"[Epoch {epoch}] valid_sharpe={val_stats.get('sharpe', 0):.4f} "
@@ -751,20 +754,19 @@ class Trainer:
             self.logger.close()
 
     def _run_epoch(self, loader: DataLoader, epoch: int) -> Dict[str, float]:
-        """
-        GRPO Training Epoch.
-        Samples multiple actions (groups) per input and uses PPO-style clipped loss.
-        """
+        """Sharpe/DPR gradient ascent epoch."""
         self.model.train()
         total_loss = 0.0
-        total_pg_loss = 0.0
+        total_rl_loss = 0.0
         total_rank_loss = 0.0
         total_entropy = 0.0
-        total_kl = 0.0
         total_return = 0.0
+        total_std = 0.0
         total_rank_corr = 0.0
-        total_turnover_penalty = 0.0
-        total_updates = 0
+        total_objective = 0.0
+        total_sharpe = 0.0
+        total_downside = 0.0
+        total_cost = 0.0
         batch_count = 0
 
         rank_coef_value = self._rank_coef_for_epoch(epoch)
@@ -773,135 +775,94 @@ class Trainer:
             features, rewards_norm, rewards_raw, mask = self._move_batch_to_device(batch)
             batch_count += 1
 
+            logits, _ = self.model(features, mask)
+            weights = self._compute_portfolio_weights(logits, mask)
+            returns, cost = self._compute_strategy_returns(weights, rewards_raw)
+            base_loss, loss_info = self._compute_rl_loss(returns)
+
+            rank_loss = None
+            if rank_coef_value > 0:
+                rank_loss = self._compute_aux_rank_loss(logits, rewards_norm, mask)
+
+            l1_penalty = self.model.feature_l1_penalty() if self.feature_l1_coef > 0 else logits.new_zeros(())
+            entropy = -(weights.clamp_min(1e-8) * weights.clamp_min(1e-8).log()).sum(dim=-1).mean()
+            loss = base_loss - self.entropy_coef * entropy + self.feature_l1_coef * l1_penalty
+            if rank_loss is not None:
+                loss = loss + rank_coef_value * rank_loss
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"[Warning] NaN/Inf loss at step {step}, skipping")
+                continue
+
+            self._backward_with_accum(loss, count_global_step=True)
+
             with torch.no_grad():
-                logits, _ = self.model(features, mask)
-                masked_logits = logits.masked_fill(~mask, -1e9)
-                log_probs = F.log_softmax(masked_logits / self.temperature, dim=-1)
-                sampled_masks, old_log_probs = sample_topk_actions(
-                    logits,
-                    mask,
-                    top_k=self.current_train_k,
-                    group_size=self.group_size,
-                    temperature=self.temperature,
-                )
-                sampled_masks = sampled_masks.detach()
-                sampled_mask_float = sampled_masks.float()
-                old_log_probs = old_log_probs.detach()
-
-                raw_rewards_exp = rewards_raw.unsqueeze(1).expand(-1, self.group_size, -1)
-                selected_raw = (raw_rewards_exp * sampled_mask_float).sum(dim=-1)
-                selected_counts = sampled_mask_float.sum(dim=-1).clamp(min=1.0)
-                sqrt_counts = torch.sqrt(selected_counts).clamp(min=1.0)
-                if self.turnover_cost > 0:
-                    turnover_penalty = self.turnover_cost * (selected_counts / max(float(self.current_train_k), 1.0))
-                else:
-                    turnover_penalty = torch.zeros_like(selected_counts)
-                sample_returns = (selected_raw - turnover_penalty) / sqrt_counts
-                avg_batch_return = sample_returns.mean()
-
-                mean_return = sample_returns.mean(dim=1, keepdim=True)
-                std_return = sample_returns.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-3)
-                advantages = (sample_returns - mean_return) / std_return
-
                 rank_corr_value = compute_rank_correlation(logits, rewards_norm, mask).mean().item()
 
-            advantages = advantages.detach()
-            sampled_mask_float = sampled_mask_float.detach()
-            selected_counts = selected_counts.detach()
-            turnover_penalty_value = turnover_penalty.mean().item()
-            adv_mean_value = advantages.mean().item()
-            adv_std_value = advantages.std(unbiased=False).item()
-            avg_return_value = (avg_batch_return / self.reward_scale).item()
+            entropy_value = entropy.detach().item()
+            objective_value = loss_info["objective"].detach().item()
+            mean_return_value = loss_info["mean_return"].detach().item()
+            std_return_value = loss_info["std_return"].detach().item()
+            sharpe_value = loss_info.get("sharpe", loss_info["objective"]).detach().item()
+            downside_value = loss_info["downside_penalty"].detach().item() if "downside_penalty" in loss_info else 0.0
+            rank_loss_value = rank_loss.item() if rank_loss is not None else 0.0
+            base_loss_value = base_loss.item()
+            cost_value = cost.mean().item()
 
-            total_return += avg_return_value
+            total_loss += loss.item()
+            total_rl_loss += base_loss_value
+            total_entropy += entropy_value
+            total_return += mean_return_value
+            total_std += std_return_value
             total_rank_corr += rank_corr_value
-            total_turnover_penalty += turnover_penalty_value
+            total_objective += objective_value
+            total_sharpe += sharpe_value
+            total_downside += downside_value
+            total_cost += cost_value
+            if rank_loss is not None:
+                total_rank_loss += rank_loss_value
 
-            for ppo_epoch in range(self.ppo_epochs):
-                logits, _ = self.model(features, mask)
-                masked_logits = logits.masked_fill(~mask, -1e9)
-                all_log_probs = F.log_softmax(masked_logits / self.temperature, dim=-1)
-                all_log_probs_exp = all_log_probs.unsqueeze(1).expand(-1, self.group_size, -1)
-                numerator = (all_log_probs_exp * sampled_mask_float).sum(dim=-1)
-                new_log_probs = numerator / selected_counts
-
-                ratio = torch.exp(new_log_probs - old_log_probs)
-                surr1 = ratio * advantages
-                surr2 = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * advantages
-                pg_loss = -torch.min(surr1, surr2).mean()
-
-                kl_div = (old_log_probs - new_log_probs).mean()
-                probs = all_log_probs.exp()
-                entropy = -(probs * all_log_probs).sum(dim=-1).mean()
-
-                rank_loss = None
-                if rank_coef_value > 0:
-                    rank_loss = self._compute_aux_rank_loss(logits, rewards_norm, mask)
-
-                l1_penalty = self.model.feature_l1_penalty() if self.feature_l1_coef > 0 else logits.new_zeros(())
-                loss = pg_loss - self.entropy_coef * entropy + self.kl_coef * kl_div + self.feature_l1_coef * l1_penalty
-                if rank_loss is not None:
-                    loss = loss + rank_coef_value * rank_loss
-
-                if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"[Warning] NaN/Inf loss at step {step} (ppo_iter {ppo_epoch}), skipping")
-                    continue
-
-                self._backward_with_accum(loss, count_global_step=True)
-
-                total_loss += loss.item()
-                total_pg_loss += pg_loss.item()
-                total_entropy += entropy.item()
-                total_kl += kl_div.item()
-                if rank_loss is not None:
-                    total_rank_loss += rank_loss.item()
-                total_updates += 1
-
-                if ppo_epoch == self.ppo_epochs - 1:
-                    rank_loss_value = rank_loss.item() if rank_loss is not None else 0.0
-                    ratio_mean = ratio.mean().item()
-                    ratio_std = ratio.std(unbiased=False).item()
-                    step_metrics = {
-                        "loss": loss.item(),
-                        "pg_loss": pg_loss.item(),
-                        "rank_loss": rank_loss_value,
-                        "feature_l1": l1_penalty.item() if self.feature_l1_coef > 0 else 0.0,
-                        "entropy": entropy.item(),
-                        "kl": kl_div.item(),
-                        "avg_return": avg_return_value,
-                        "rank_corr": rank_corr_value,
-                        "ratio_mean": ratio_mean,
-                        "ratio_std": ratio_std,
-                        "advantage_mean": adv_mean_value,
-                        "advantage_std": adv_std_value,
-                        "turnover_penalty": turnover_penalty_value,
-                        "lr": self.optimizer.param_groups[0]["lr"],
-                        "epoch": epoch,
-                        "epoch_step": step,
-                        "train_top_k": self.current_train_k,
-                        "rank_coef": rank_coef_value,
-                        "kl_coef": self.kl_coef,
-                    }
-                    self.logger.log_metrics("train_step", step_metrics, step=self.global_step)
-                    pbar.set_postfix(
-                        loss=f"{loss.item():.4f}",
-                        rank_corr=f"{rank_corr_value:.4f}",
-                        ret=f"{avg_return_value:.5f}",
-                    )
+            step_metrics = {
+                "loss": loss.item(),
+                "rl_loss": base_loss_value,
+                "rank_loss": rank_loss_value,
+                "feature_l1": l1_penalty.item() if self.feature_l1_coef > 0 else 0.0,
+                "entropy": entropy_value,
+                "avg_return": mean_return_value,
+                "std_return": std_return_value,
+                "rl_objective": objective_value,
+                "sharpe": sharpe_value,
+                "downside_penalty": downside_value,
+                "avg_cost": cost_value,
+                "rank_corr": rank_corr_value,
+                "lr": self.optimizer.param_groups[0]["lr"],
+                "epoch": epoch,
+                "epoch_step": step,
+                "rl_top_k": self.rl_top_k,
+                "rank_coef": rank_coef_value,
+            }
+            self.logger.log_metrics("train_step", step_metrics, step=self.global_step)
+            pbar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                sharpe=f"{sharpe_value:.4f}",
+                ret=f"{mean_return_value:.5f}",
+            )
 
         self._flush_optimizer(count_global_step=True)
-        n_updates = max(total_updates, 1)
         n_batches = max(batch_count, 1)
-        avg_rank_loss = total_rank_loss / n_updates if rank_coef_value > 0 else 0.0
+        avg_rank_loss = total_rank_loss / n_batches if rank_coef_value > 0 else 0.0
         return {
-            "loss": total_loss / n_updates,
-            "pg_loss": total_pg_loss / n_updates,
+            "loss": total_loss / n_batches,
+            "rl_loss": total_rl_loss / n_batches,
             "rank_loss": avg_rank_loss,
-            "entropy": total_entropy / n_updates,
-            "kl": total_kl / n_updates,
+            "entropy": total_entropy / n_batches,
             "avg_return": total_return / n_batches,
+            "std_return": total_std / n_batches,
             "rank_corr": total_rank_corr / n_batches,
-            "turnover_penalty": total_turnover_penalty / n_batches,
+            "rl_objective": total_objective / n_batches,
+            "sharpe": total_sharpe / n_batches,
+            "downside_penalty": total_downside / n_batches,
+            "avg_cost": total_cost / n_batches,
         }
 
     def evaluate(self, dataset: DailyBatchDataset, stage: str, epoch: int) -> Tuple[pd.DataFrame, Dict[str, float]]:
@@ -943,8 +904,12 @@ def load_config(path: Path) -> Dict:
 def main():
     parser = argparse.ArgumentParser(description="Train Transformer policy with direct return optimization")
     parser.add_argument("--config", type=Path, default=Path("pipelines/transformer_grpo/config_cn_t1.yaml"))
+    parser.add_argument("--rl-checkpoint", type=Path, help="Load weights for RL-only fine-tuning", default=None)
     args = parser.parse_args()
-    trainer = Trainer(load_config(args.config))
+    config = load_config(args.config)
+    if args.rl_checkpoint:
+        config.setdefault("training", {})["rl_checkpoint_path"] = str(args.rl_checkpoint)
+    trainer = Trainer(config)
     trainer.train()
 
 
