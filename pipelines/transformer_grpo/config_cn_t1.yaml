@@ -73,18 +73,25 @@ training:
   learning_rate: 0.0003
   weight_decay: 0.01
   entropy_coef: 0.001
-  rl_objective: sharpe   # sharpe | dpr | hybrid
+  rl_objective: mean_var   # sharpe | dpr | hybrid | mean_var | log_return
+  variance_lambda: 0.2
   downside_lambda: 0.5
   sharpe_eps: 1.0e-04
-  rl_checkpoint_path: null   # set to a ckpt to skip pretrain and start RL-only
+  sharpe_denom_floor: 0.05
+  rl_checkpoint_path: data/pretrain.pt   # set to a ckpt to skip pretrain and start RL-only
   load_rl_optimizer: false
   rank_coef: 0.05
   rank_coef_final: 0.0
   rank_coef_decay_epochs: 10
   turnover_cost: 0.001
-  grad_clip: 1.0
+  grad_clip: 0.5
   grad_accum_steps: 24
+  kl_coef: 0.02
+  kl_temperature: 1.0
   early_stop_patience: 20
+  selection_metric: sharpe_ic   # sharpe | sharpe_ic
+  selection_sharpe_weight: 0.5
+  selection_ic_weight: 0.5
   pretrain_epochs: 20
   pretrain_early_stop_patience: 5   # 0 disables valid-based early stop
   eval_test_each_epoch: test       # true logs test metrics every epoch (disables strict test isolation)
@@ -104,6 +111,7 @@ training:
   pretrain_listmle_warmup_steps: 2000
   feature_l1_coef: 1.0e-05
   rank_loss_type: ic
+  log_return_min: -0.95
 
   dataloader:
     num_workers: 16

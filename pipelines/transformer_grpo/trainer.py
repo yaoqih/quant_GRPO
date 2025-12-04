@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import gc
 import json
 from datetime import datetime
@@ -176,10 +177,19 @@ class Trainer:
         self.rl_objective = (self.train_cfg.get("rl_objective", "sharpe") or "sharpe").lower()
         self.downside_lambda = float(self.train_cfg.get("downside_lambda", 0.5))
         self.sharpe_eps = float(self.train_cfg.get("sharpe_eps", 1e-4))
+        self.sharpe_denom_floor = float(self.train_cfg.get("sharpe_denom_floor", 0.0))
+        self.variance_lambda = float(self.train_cfg.get("variance_lambda", 0.0))
+        self.log_return_min = float(self.train_cfg.get("log_return_min", -0.95))
+        self.kl_coef = float(self.train_cfg.get("kl_coef", 0.0))
+        self.kl_temperature = float(self.train_cfg.get("kl_temperature", self.temperature))
+        self.selection_mode = (self.train_cfg.get("selection_metric") or "sharpe").lower()
+        self.selection_sharpe_weight = float(self.train_cfg.get("selection_sharpe_weight", 0.5))
+        self.selection_ic_weight = float(self.train_cfg.get("selection_ic_weight", 0.5))
         rl_ckpt = self.train_cfg.get("rl_checkpoint_path")
         self.rl_checkpoint_path = Path(rl_ckpt).expanduser() if rl_ckpt else None
         self.load_rl_optimizer = bool(self.train_cfg.get("load_rl_optimizer", False))
         self.rl_only_mode = self.rl_checkpoint_path is not None
+        self.reference_model: Optional[TransformerPolicy] = None
 
         self.global_step = 0
         self.no_improve_epochs = 0
@@ -194,11 +204,16 @@ class Trainer:
         if self.run_pretrain:
             self._pretrain_policy()
             self._save_checkpoint("pretrain.pt", 0)
+            if self.kl_coef > 0 and self.continue_rl:
+                self._capture_reference_model()
             if self.logger_split_runs and self.continue_rl:
                 self.logger.close()
                 self.logger = self._build_logger("rl")
-        elif self.rl_only_mode and self.pretrain_epochs > 0:
-            print(f"[Trainer] RL checkpoint provided, skipping pretrain stage (requested epochs={self.pretrain_epochs}).")
+        else:
+            if self.rl_only_mode and self.pretrain_epochs > 0:
+                print(f"[Trainer] RL checkpoint provided, skipping pretrain stage (requested epochs={self.pretrain_epochs}).")
+            if self.kl_coef > 0:
+                self._capture_reference_model()
 
         if self.pretrain_epochs > 0 and not self.continue_rl and not self.rl_only_mode:
             print("[Trainer] RL training skipped per configuration `continue_rl_after_pretrain=False`.")
@@ -257,6 +272,19 @@ class Trainer:
         if "global_step" in checkpoint:
             self.global_step = int(checkpoint["global_step"])
 
+    def _capture_reference_model(self) -> None:
+        if self.reference_model is not None:
+            return
+        reference = TransformerPolicy(
+            feature_dim=self.train_dataset.feature_dim,
+            **self.model_cfg,
+        ).to(self.device)
+        reference.load_state_dict(copy.deepcopy(self.model.state_dict()))
+        reference.eval()
+        for param in reference.parameters():
+            param.requires_grad_(False)
+        self.reference_model = reference
+
     def _compute_portfolio_weights(self, logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         return compute_topk_weights(
             logits=logits,
@@ -266,6 +294,26 @@ class Trainer:
             min_weight=0.0,
             differentiable=True,
         )
+
+    def _compute_policy_probs(self, logits: torch.Tensor, mask: torch.Tensor, temperature: float) -> torch.Tensor:
+        safe_temp = max(float(temperature), 1e-4)
+        masked_logits = logits.masked_fill(~mask, -1e9)
+        scaled = masked_logits / safe_temp
+        probs = F.softmax(scaled, dim=-1)
+        probs = probs * mask.float()
+        probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        return probs
+
+    def _kl_divergence(self, features: torch.Tensor, mask: torch.Tensor, rl_logits: torch.Tensor) -> torch.Tensor:
+        if self.reference_model is None or self.kl_coef <= 0:
+            return rl_logits.new_zeros(())
+        with torch.no_grad():
+            ref_logits, _ = self.reference_model(features.detach(), mask)
+        rl_probs = self._compute_policy_probs(rl_logits, mask, self.temperature)
+        ref_probs = self._compute_policy_probs(ref_logits, mask, self.kl_temperature)
+        eps = 1e-8
+        kl = (rl_probs * (torch.log(rl_probs + eps) - torch.log(ref_probs + eps))).sum(dim=-1)
+        return kl.mean()
 
     def _compute_strategy_returns(self, weights: torch.Tensor, rewards_raw: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         scale = self.reward_scale if self.reward_scale > 1e-8 else 1.0
@@ -281,8 +329,9 @@ class Trainer:
 
     def _sharpe_loss(self, returns: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         mean = returns.mean()
-        std = returns.std(unbiased=False).clamp_min(self.sharpe_eps)
-        sharpe = mean / std
+        std = returns.std(unbiased=False)
+        denom = (std + self.sharpe_denom_floor).clamp_min(self.sharpe_eps)
+        sharpe = mean / denom
         loss = -sharpe
         return loss, {
             "objective": sharpe,
@@ -296,14 +345,48 @@ class Trainer:
         downside = torch.clamp(returns, max=0.0)
         penalty = (downside.pow(2)).mean()
         objective = mean - self.downside_lambda * penalty
-        std = returns.std(unbiased=False).clamp_min(self.sharpe_eps)
-        sharpe = mean / std
+        std = returns.std(unbiased=False)
+        denom = (std + self.sharpe_denom_floor).clamp_min(self.sharpe_eps)
+        sharpe = mean / denom
         loss = -objective
         return loss, {
             "objective": objective,
             "mean_return": mean,
             "std_return": std,
             "downside_penalty": penalty,
+            "sharpe": sharpe,
+        }
+
+    def _mean_variance_loss(self, returns: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        mean = returns.mean()
+        variance = returns.var(unbiased=False)
+        objective = mean - self.variance_lambda * variance
+        std = returns.std(unbiased=False)
+        denom = (std + self.sharpe_denom_floor).clamp_min(self.sharpe_eps)
+        sharpe = mean / denom
+        loss = -objective
+        return loss, {
+            "objective": objective,
+            "mean_return": mean,
+            "std_return": std,
+            "variance": variance,
+            "sharpe": sharpe,
+        }
+
+    def _log_return_loss(self, returns: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        clamped = torch.clamp(returns, min=self.log_return_min)
+        log_ret = torch.log1p(clamped)
+        objective = log_ret.mean()
+        mean = returns.mean()
+        std = returns.std(unbiased=False)
+        denom = (std + self.sharpe_denom_floor).clamp_min(self.sharpe_eps)
+        sharpe = mean / denom
+        loss = -objective
+        return loss, {
+            "objective": objective,
+            "mean_return": mean,
+            "std_return": std,
+            "log_return": objective,
             "sharpe": sharpe,
         }
 
@@ -318,6 +401,10 @@ class Trainer:
             merged.update({k: v for k, v in sharpe_info.items() if k not in merged or k == "sharpe"})
             merged["objective"] = 0.5 * (sharpe_info["objective"] + dpr_info["objective"])
             return loss, merged
+        if self.rl_objective == "mean_var":
+            return self._mean_variance_loss(returns)
+        if self.rl_objective == "log_return":
+            return self._log_return_loss(returns)
         return self._sharpe_loss(returns)
 
     def _evaluate_pretrain_dataset(self, dataset: DailyBatchDataset) -> Dict[str, float]:
@@ -382,6 +469,43 @@ class Trainer:
         self._loader_prefetches_device = prev_prefetch
         self._loader_pin_memory = prev_pin
         return metrics
+
+    def _compute_rank_metrics(self, dataset: DailyBatchDataset) -> Dict[str, float]:
+        if len(dataset) == 0:
+            return {}
+        prev_prefetch = self._loader_prefetches_device
+        prev_pin = self._loader_pin_memory
+        was_training = self.model.training
+        loader = self._build_loader(dataset, shuffle=False)
+        self.model.eval()
+
+        total_rank = 0.0
+        steps = 0
+        with torch.no_grad():
+            for batch in loader:
+                features, rewards_norm, _rewards_raw, mask = self._move_batch_to_device(batch)
+                logits, _ = self.model(features, mask)
+                rank_corr = compute_rank_correlation(logits, rewards_norm, mask).mean()
+                total_rank += rank_corr.item()
+                steps += 1
+
+        if was_training:
+            self.model.train()
+        self._loader_prefetches_device = prev_prefetch
+        self._loader_pin_memory = prev_pin
+        return {"rank_ic": total_rank / max(steps, 1)}
+
+    def _selection_score(self, stats: Dict[str, float]) -> float:
+        if not stats:
+            return float("-inf")
+        mode = self.selection_mode
+        if mode == "sharpe_ic":
+            sharpe = stats.get("sharpe")
+            ic = stats.get("rank_ic")
+            if sharpe is None or ic is None:
+                return float("-inf")
+            return self.selection_sharpe_weight * sharpe + self.selection_ic_weight * ic
+        return stats.get("sharpe", float("-inf"))
 
     def _build_datasets(self):
         """构建数据集，顺序处理以减少内存峰值。"""
@@ -731,7 +855,7 @@ class Trainer:
                 test_stats = {}
                 if len(self.valid_dataset) > 0:
                     _, val_stats = self.evaluate(self.valid_dataset, "valid", epoch)
-                    metric_val = val_stats.get("sharpe", float("-inf"))
+                    metric_val = val_stats.get("selection_score", self._selection_score(val_stats))
                     if metric_val > best_metric:
                         best_metric = metric_val
                         best_epoch = epoch
@@ -787,6 +911,7 @@ class Trainer:
         total_sharpe = 0.0
         total_downside = 0.0
         total_cost = 0.0
+        total_kl_loss = 0.0
         batch_count = 0
 
         rank_coef_value = self._rank_coef_for_epoch(epoch)
@@ -810,6 +935,11 @@ class Trainer:
             if rank_loss is not None:
                 loss = loss + rank_coef_value * rank_loss
 
+            kl_penalty = None
+            if self.kl_coef > 0 and self.reference_model is not None:
+                kl_penalty = self._kl_divergence(features, mask, logits)
+                loss = loss + self.kl_coef * kl_penalty
+
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"[Warning] NaN/Inf loss at step {step}, skipping")
                 continue
@@ -828,6 +958,7 @@ class Trainer:
             rank_loss_value = rank_loss.item() if rank_loss is not None else 0.0
             base_loss_value = base_loss.item()
             cost_value = cost.mean().item()
+            kl_loss_value = kl_penalty.item() if kl_penalty is not None else 0.0
 
             total_loss += loss.item()
             total_rl_loss += base_loss_value
@@ -841,6 +972,7 @@ class Trainer:
             total_cost += cost_value
             if rank_loss is not None:
                 total_rank_loss += rank_loss_value
+            total_kl_loss += kl_loss_value
 
             step_metrics = {
                 "loss": loss.item(),
@@ -855,6 +987,7 @@ class Trainer:
                 "downside_penalty": downside_value,
                 "avg_cost": cost_value,
                 "rank_corr": rank_corr_value,
+                "kl_loss": kl_loss_value,
                 "lr": self.optimizer.param_groups[0]["lr"],
                 "epoch": epoch,
                 "epoch_step": step,
@@ -883,9 +1016,11 @@ class Trainer:
             "sharpe": total_sharpe / n_batches,
             "downside_penalty": total_downside / n_batches,
             "avg_cost": total_cost / n_batches,
+            "kl_loss": total_kl_loss / n_batches,
         }
 
     def evaluate(self, dataset: DailyBatchDataset, stage: str, epoch: int) -> Tuple[pd.DataFrame, Dict[str, float]]:
+        was_training = self.model.training
         trades, summary = run_backtest(
             model=self.model, dataset=dataset, device=self.device,
             top_k=int(self.backtest_cfg.get("top_k", 10)),
@@ -896,12 +1031,19 @@ class Trainer:
             reward_scale=self.reward_scale,
         )
 
+        rank_metrics = self._compute_rank_metrics(dataset)
+        summary.update(rank_metrics)
+        summary["selection_score"] = self._selection_score(summary)
+
         stage_dir = ensure_dir(self.work_dir / stage)
         save_trades(trades, stage_dir / f"{stage}_trades.csv")
         self.logger.log_metrics(stage, {"epoch": epoch, **summary})
 
         with (stage_dir / f"{stage}_metrics_epoch_{epoch}.json").open("w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
+
+        if was_training:
+            self.model.train()
 
         return trades, summary
 
